@@ -2,7 +2,7 @@
 Description=Dell Poweredge Fan Control Daemon
 
 [Service]
-ExecStart=/usr/local/bin/fan-speed-control.pl
+ExecStart=perl /usr/local/bin/fan-speed-control.pl
 Restart=on-failure
 Type=simple
 
