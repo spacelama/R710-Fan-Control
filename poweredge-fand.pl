@@ -29,8 +29,8 @@ my $hysteresis    = 2;     # don't ramp up velocity unless demand
                            # thus end up removing noise changes for
                            # just small changes in computing
 
-# check inlet temp every minute, hddtemp every minute (but FIXME:
-# ensure doesn't spinup spundown disks), and sensors every few seconds
+# check inlet temp every minute, hddtemp every minute (ensuring
+# doesn't spinup spundown disks), and sensors every few seconds
 
 # background information:
 # https://www.dell.com/community/PowerEdge-Hardware-General/T130-Fan-Speed-Algorithm/td-p/5052692
