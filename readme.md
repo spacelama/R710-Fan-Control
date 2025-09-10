@@ -34,9 +34,16 @@ I wrote it the night before Australia's hottest December day on record
 coping so far now that it has reached that predicted peak (I don't
 believe it's only 26 in my un-air conditioned study).
 
+It also includes my own hddtemp implementation that intercepts
+smartctl so it doesn't spin up spundown disks that aren' always
+detected by `smartctl --nocheck=standby,0`, and tries to parse SAS
+drives and NVME drives via a forked [munin-smart-nvme
+repo](https://github.com/spacelama/munin-smart-nvme), munging them
+into the same format (and subject to the same spindown tests).
+
 # installation (debian/proxmox)
 
-It's in my [ansible
+This repo is included via my [ansible
 module](https://github.com/spacelama/ansible-initial-server-setup/tree/master/roles/dell_server)
 (which you won't want to use in full, but you can certainly adapt),
 but manual installation is:
@@ -47,7 +54,7 @@ sudo apt install liblist-moreutils-perl lm-sensors ipmitool
 sudo apt remove hddtemp
 
 sudo cp -p poweredge-fand.pl /usr/local/bin && sudo chmod 755 /usr/local/bin/poweredge-fand.pl
-sudo cp -p hddtemp /usr/local/bin && sudo chmod 755 /usr/local/bin/hddtemp
+sudo cp -p hddtemp smart-intercept-spindown smartctlnvme /usr/local/bin/ && sudo chmod 755 /usr/local/bin/{hddtemp,smart-intercept-spindown,smartctlnvme}
 sudo cp -p poweredge-fand.service /etc/systemd/system/poweredge-fand.service
 sudo systemctl daemon-reload
 sudo systemctl --now enable poweredge-fand.service
@@ -56,11 +63,26 @@ sudo systemctl --now enable poweredge-fand.service
 [Reddit discussion](https://www.reddit.com/r/homelab/comments/ed6w7y)
 
 # Possibly required modifications/tuning
-The code's configuration is in the script, unfortunately.  It's also configured for my *specific* R730XD's in my specific climate with my specific drives and tolerance for noise.  This code comes with no warranty - you are expected to both tune it, and monitor for possible failures or things being too hot.  For the R710, you'll probably need to modify the regexps looking for "Inlet Temp" to whatever's your version of ambient air temperature - you might need to anchor the text since it's only using grep to filter the results.
+The code's configuration is in the script, unfortunately.  It's also
+configured for my *specific* R730XD's in my specific climate with my
+specific drives and tolerance for noise.  This code comes with no
+warranty - you are expected to both tune it, and monitor for possible
+failures or things being too hot.  For the R710, you'll probably need
+to modify the regexps looking for "Inlet Temp" to whatever's your
+version of ambient air temperature - you might need to anchor the text
+since it's only using grep to filter the results.
 
-You might want to modify setpoints and thresholds.  $demand isn't actually a percentage. That code is a mess, $static_speed_high is more or less arbitrary - the initial ramps are chosen to sort of scale from an input of 0-255 and map to 0x02 to 0x12 ($static_speed_low to $static_speed_high), which is bloody loud and fast on my machines, but are allowed to continue linearly even further all the way to 255 if necessary if the temperature ramps up to 6 million degrees.
+You might want to modify setpoints and thresholds.  $demand isn't
+actually a percentage. That code is a mess, $static_speed_high is more
+or less arbitrary - the initial ramps are chosen to sort of scale from
+an input of 0-255 and map to 0x02 to 0x12 ($static_speed_low to
+$static_speed_high), which is bloody loud and fast on my machines, but
+are allowed to continue linearly even further all the way to 255 if
+necessary if the temperature ramps up to 6 million degrees.
 
-I found it simple to test by starting up a whole bunch of busy loops on each of the 32 cores in my machine, heating each core up to 60degC and making sure the fans ramped up high:
+I found it simple to test by starting up a whole bunch of busy loops
+on each of the 32 cores in my machine, heating each core up to 60degC
+and making sure the fans ramped up high:
 ```
 >  grep processor /proc/cpuinfo | wc -l
 64
@@ -100,11 +122,12 @@ measures your room temperature) temperature are polled less frequently
 than coretemps, given they don't change as rapidly and are more expensive
 to read.
 
-This script monitors the ambient air temperature (you will likely
-need to modify the $ipmi_inlet_sensorname variable to find the correct
+This script monitors the ambient air temperature (you will likely need
+to modify the $ipmi_inlet_sensorname variable to find the correct
 sensor), the hdd temperatures, the core and socket temperatures
-(weighted so one core shooting up if all the others are still cold doesn't suddenly convert your machine into an airfreighter taking off -
-let the heatsink do its job).
+(weighted so one core shooting up if all the others are still cold
+doesn't suddenly convert your machine into an airfreighter taking
+off - let the heatsink do its job).
 
 It uses setpoints and temperature ranges you can tune to your heart's
 content.  I use it to keep the fans low but increasing to a soft
@@ -148,7 +171,9 @@ hysteresis](https://github.com/nabijaczleweli/tarta-crust/blob/master/r710_fan_c
 
 # Historical Howto: Fallback and manually testing setting the fan speed of the Dell R610/R710
 
-Historical notes and stuff it's partially relying on behind the scenes, and if you have problems with the code, you may find yourself digging through this:
+Historical notes and stuff it's partially relying on behind the
+scenes, and if you have problems with the code, you may find yourself
+digging through this:
 
 1. Enable IPMI in iDrac
 2. Install ipmitool on linux, win or mac os

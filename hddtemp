@@ -22,11 +22,9 @@ $ENV{PATH}="$ENV{PATH}:/usr/sbin:/sbin";
 
 my $last_exit=0;
 foreach my $drive (@ARGV) {
-  my $sense=`sdparm --command=sense $drive 2>/dev/null`;
-  if (!($sense =~ /Standby/)) {
-    my $output=`smartctl -A -i --nocheck=standby,0 $drive`;
-    $last_exit = $?>>8;
-
+  my $output=`/usr/local/bin/smart-intercept-spindown -A -i $drive`;
+  $last_exit = $?>>8;
+  if (!($output =~ /Standby condition/)) {
     my $model="";
     if ($output =~ /(Model Number|Device Model):\s*(.*)/) {
       $model="$2: ";

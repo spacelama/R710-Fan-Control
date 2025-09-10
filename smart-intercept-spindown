@@ -1,0 +1,132 @@
+#!/bin/bash
+
+# For those disks like some of my SAS drives where `smartctl
+# --nocheck=standby` and `hdparm -C` actually spins up the disk,
+# detect whether a disk is spun down with sdparm commands, and don't
+# invoke smartctl if it is.  Otherwise, some of our other disks like
+# our 16TB SATA drives on Dell Perc controllers give unreliable status to `sdparm
+# --command=sense`, but `smartctl --nocheck=standby` does seem to
+# reliably detect their spundown state anyway, so we continue to
+# supply `--nocheck=standby` to cover this case.
+
+# While we're here, we might as well try transform the mimimal output
+# smartctl gives us on SAS drives into something we can parse too, so
+# we can at least get temperatures for hddtemp_smartctl's use.  We
+# also detect nvme drives and pass off a request to smartctlnvme for
+# it to give us smartctl style output on them.
+
+final_arg="${@: -1}"
+
+convert_sas() {
+    read_initial=true
+    read_data=false
+    device_model=
+    device_product=
+    local exit_code=0
+    while read line ; do
+        case "$read_initial,$read_data,$line" in
+            true,false,*DATA\ SECTION*)
+                read_initial=false
+                read_data=true
+                echo "Device Model: $device_vendor $device_product"
+                echo "$line"
+                echo "ID# ATTRIBUTE_NAME          FLAG     VALUE WORST THRESH TYPE      UPDATED  WHEN_FAILED RAW_VALUE"
+                ;;
+            true,false,Vendor:*)
+                device_vendor="$( echo "$line" | sed 's/Vendor: *//' )"
+                ;;
+            true,false,Product:*)
+                device_product="$( echo "$line" | sed 's/Product: *//' )"
+                ;;
+            true*)
+                echo "$line"
+                ;;
+            false,true,SMART\ Health\ Status:*)
+                if [[ "$line" == *OK ]] ; then
+                    exit_code=0
+                else
+                    exit_code=8
+                fi
+#                echo "$line"
+                ;;
+            false,true,Current\ Drive\ Temperature:*)
+                temp="$( echo "$line" | sed 's/.*Temperature: *// ; s/ C$//' )"
+                ;;
+            false,true,Drive\ Trip\ Temperature:*)
+                temp_threshold="$( echo "$line" | sed 's/.*Drive Trip Temperature: *// ; s/ C$//' )"
+                hundred_minus_temp="$( printf "%03.f" "$( echo "100 - $temp" | bc -l )" )"
+                echo "194 Temperature_Celsius null $hundred_minus_temp $hundred_minus_temp 000 Old_age Always - $temp (Min/Max 0/$temp_threshold)"
+                ;;
+            false,true,Accumulated\ power\ on\ time,\ hours:minutes:*)
+                hours="$( echo "$line" | sed 's/.*hours:minutes // ; s/:.*//' )"
+#                minutes="$( echo "$line" | sed 's/.*hours:minutes // ; s/.*://' )"
+#                hours="$( echo "scale=2 ; $hours + $minutes/60" | bc -l )"
+                echo "9 Power_On_Hours null 100 100 000 Old_age Always - $hours"
+                ;;
+            false,true,Specified\ cycle\ count\ over\ device\ lifetime:*)
+                start_stop_cycles_threshold="$( echo "$line" | sed 's/.*Specified cycle count over device lifetime: *//' )"
+                ;;
+            false,true,Accumulated\ start-stop\ cycles:*)
+                start_stop_cycles="$( echo "$line" | sed 's/.*Accumulated start-stop cycles: *//' )"
+                hundred_minus_cycles="$( printf "%03.f" "$( echo "100 - 100*$start_stop_cycles/$start_stop_cycles_threshold" | bc -l )" )"
+                echo "12 Power_Cycle_Count null $hundred_minus_cycles $hundred_minus_cycles 000 Pre-fail Always - $start_stop_cycles"
+                ;;
+            false,true,Specified\ load-unload\ count\ over\ device\ lifetime:*)
+                load_unload_cycles_threshold="$( echo "$line" | sed 's/.*Specified load-unload count over device lifetime: *//' )"
+                ;;
+            false,true,Accumulated\ load-unload\ cycles:*)
+                load_unload_cycles="$( echo "$line" | sed 's/.*Accumulated load-unload cycles: *//' )"
+                hundred_minus_cycles="$( printf "%03.f" "$( echo "100 - 100*$load_unload_cycles/$load_unload_cycles_threshold" | bc -l )" )"
+                echo "193 Load_Cycle_Count null $hundred_minus_cycles $hundred_minus_cycles 000 Pre-fail Always - $load_unload_cycles"
+                ;;
+            false,true,Elements\ in\ grown\ defect\ list:*)
+                defects="$( echo "$line" | sed 's/.*Elements in grown defect list: //' )"
+                echo "5 Reallocated_Sector_Ct null 100 100 001 Pre-fail Always - $defects"
+                ;;
+            false,true,Non-medium\ error\ count:*)
+                errors="$( echo "$line" | sed 's/.*Non-medium error count: //' )"
+                echo "1 Raw_Read_Error_Rate null 100 100 001 Pre-fail Always - $errors"
+                ;;
+        esac
+    done <<< "$1"
+
+    return $exit_code
+}
+
+if [ "1" = --version ] ; then
+    # allow munin smart_ check to test for support of --nocheck=standby to ensure it doesnt' then run hdparm
+    exec smartctl "$@"
+fi
+
+if sdparm --command=sense "$final_arg" 2>/dev/null | grep Standby; then
+    # exit code success rather than code 2 like smartctl by default
+    # Could do similar output with hdparm -C, but smartctl
+    # --nocheck=standby,0 correctly detects that
+    exit
+fi
+
+smart_output=$( smartctl --nocheck=standby,0 "$@" )
+exit_code=$?
+
+case "$smart_output" in
+    *Transport*protocol:*SAS*)
+        convert_sas "$smart_output"
+        convert_exit=$?
+
+        # FIXME: should work out a proper exit code precedence rule
+        if (( $convert_exit > $exit_code )) ; then
+            exit $convert_exit
+        fi
+        exit $exit_code
+        ;;
+    *NVMe*Version*)
+        # to transform smartctl nvme output to more resemble
+        # traditional output so existing munin plugins can monitor it
+        exec /usr/local/bin/smartctlnvme "$@"
+        ;;
+    *)
+        echo "$smart_output"
+        ;;
+esac
+
+exit $exit_code
