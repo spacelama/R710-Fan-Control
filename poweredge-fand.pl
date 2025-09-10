@@ -129,7 +129,7 @@ sub set_fans_servo {
   print "weighted_temp = $weighted_temp ; ambient_temp $ambient_temp\n" if $print_stats;
 
   if ((!defined $current_mode) or ($current_mode ne "set")) {
-    print "--> disable dynamic fan control\n";
+    print "--> disable dynamic fan control\n" if !($quiet and (defined $current_mode) and ($current_mode eq "reset"));
     system("ipmitool raw 0x30 0x30 0x01 0x00") == 0 or return 0;
     # if this fails, want to return telling caller not to think weve
     # made a change
