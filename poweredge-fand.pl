@@ -1,52 +1,131 @@
 #!/usr/bin/perl
 
-use strict;
-use warnings;
-use List::MoreUtils qw( apply );
-use File::Temp qw(tempfile);
-
-my $static_speed_low=0x02;
-my $static_speed_high=0x12;   # this is the speed value at 100% demand
-                              # ie what we consider the point we don't
-                              # really want to get hotter but still
-                              # tolerate
-my $ipmi_inlet_sensorname="Inlet Temp";
-
-my $default_threshold=32;  # the ambient temperature we use above
-                           # which we default back to letting the drac
-                           # control the fans
-my $base_temp     = 30;    # no fans when below this temp
-my $desired_temp1 = 40;    # aim to keep the temperature below this
-my $desired_temp2 = 45;    # really ramp up fans above this
-my $desired_temp3 = 55;    # really ramp up fans above this
-my $demand1       = 5;     # prescaled (not taking into effect static_speed_low/high) demand at temp1
-my $demand2       = 40;    # prescaled (not taking into effect static_speed_low/high) demand at temp2
-my $demand3       = 200;   # prescaled (not taking into effect static_speed_low/high) demand at temp3
-
-my $hysteresis    = 2;     # don't ramp up velocity unless demand
-                           # difference is greater than this.  Ramp
-                           # down ASAP however, to bias quietness, and
-                           # thus end up removing noise changes for
-                           # just small changes in computing
-
 # check inlet temp every minute, hddtemp every minute (ensuring
-# doesn't spinup spundown disks), and sensors every few seconds
+# doesn't spinup spundown disks), and sensors every few seconds, and
+# adjust individual fans according to own threshold curves, overriding
+# iDrac settings with fallback
 
 # background information:
 # https://www.dell.com/community/PowerEdge-Hardware-General/T130-Fan-Speed-Algorithm/td-p/5052692
 # https://serverfault.com/questions/715387/how-do-i-stop-dell-r730xd-fans-from-going-full-speed-when-broadcom-qlogic-netxtr/733064#733064
 # could monitor H710 temperature with sudo env /opt/MegaRAID/MegaCli/MegaCli64 -AdpAllInfo -aALL | grep -i temperature
 
-my @ambient_ipmitemps=();
-my @hddtemps=();
-my @coretemps=();
-my @cputemps=();
+use strict;
+use warnings;
+use List::MoreUtils qw( apply );
+use File::Temp qw(tempfile);
+use JSON;
+use Data::Dumper;
+use POSIX ":sys_wait_h"; # for nonblocking read
+use Time::HiRes qw (sleep);
+
+my $static_speed_low;
+my $static_speed_high;   # this is the speed value at 100% demand
+                         # ie what we consider the point we don't
+                         # really want to get hotter but still
+                         # tolerate
+my ($ipmi_inlet_sensorname, $ipmi_exhaust_sensorname);
+
+my $default_exhaust_threshold; # the exhaust temperature we use above
+                               # which we fail back to letting the drac
+                               # control the fans
+my $base_temp;           # no fans when below this temp
+my $desired_temp1;       # aim to keep the temperature below this
+my $desired_temp2;       # really ramp up fans above this
+my $desired_temp3;       # really ramp up fans above this
+my $demand1;             # prescaled (not taking into effect static_speed_low/high) demand at temp1
+my $demand2;             # prescaled (not taking into effect static_speed_low/high) demand at temp2
+my $demand3;             # prescaled (not taking into effect static_speed_low/high) demand at temp3
+
+my $hysteresis;          # don't ramp up velocity unless demand
+                         # difference is greater than this.  Ramp
+                         # down ASAP however, to bias quietness, and
+                         # thus end up removing noise changes for
+                         # just small changes in computing
+
+my $fans;                # which fans are being controlled by this daemon?  0xff = all fans,
+                         # 0x00 to 0x05 for individual fans
+
+sub custom_temperature_calculation;
+
+# every 20 minutes (enough to establish spin-down), invalidate the
+# cache of the slowly changing hdd temperatures to allow them to be
+# refreshed
+my $hdd_poll_interval=1200;
+# raid controller is less expensive to poll, and should't change
+# overly rapidly
+my $raid_controller_poll_interval=30;
+# every 60 seconds, invalidate the cache of the slowly changing
+# ambient temperatures to allow them to be refreshed
+my $ambient_poll_interval=60;
+my $exhaust_poll_interval=60;
+my $cpu_poll_interval=3;
+
+my $sensors_ref;
+my $temperature_calculation_sub;
 
 my $current_mode;
 my $lastfan;
 
 my $quiet=0;          # whether to print stats at all
 my $print_stats = 1;  # whether to print stats this run
+
+my $tempfilename;
+my @daemons;
+my %children;
+my $started;
+my $signame;
+
+sub print_usage {
+  print STDERR "Usage: poweredge-fand.pl [-q] [-f <conf_file>]\n";
+  exit 1;
+}
+
+sub include {
+  # http://www.perlmonks.org/?node_id=393426
+  #package DB;     # causes eval to evaluate the string in the caller's
+  # scope.  Sometimes perl can be truly horrendous
+  my ($filename) = @_;
+
+  my $code;
+  {
+    open my $fh, '<', $filename or die "Cannot open $filename: $!";
+    local $/; # Temporarily undefine the input record separator
+    $code = <$fh>;
+    close $fh;
+  }
+
+  $code = qq[#line 1 "$filename"\n] .
+    $code;
+  #  print "evaling code: $code\n";
+  eval $code;
+  if ("$@" ne "") {
+    die "Can't eval $filename: $@";
+  }
+  #  print "done...\n";
+}
+
+# to get reentrant signal handler, we set a flag.  To be as responsive
+# as possible to that flag, check before and after every time we
+# deliberately sleep as part of a loop
+sub sleep_and_check_for_exit {
+  my (@args) = (@_);
+
+  if ($signame) {
+    exit;
+  }
+  sleep @args;
+  if ($signame) {
+    exit;
+  }
+}
+
+# Only print out the stats in one of the daemons, for the first
+# fan (or the daemon that's controlling all fans simultaneously)
+sub print_stats_once {
+  return $print_stats and
+    ($fans == 0 or $fans == 0xff);
+}
 
 sub is_num {
   my ($val) = @_;
@@ -77,6 +156,25 @@ sub average {
   return $avg;
 }
 
+# calculates the weighted averages
+# (i,a, j,b, k,c, ....) as
+# i*a, j*b, k*c etc, where i,j,k etc are integers>=1
+# It still handles ignoring elements that are null
+sub weighted_average {
+  my (@v) = (@_);
+
+  my (@vp) = ();
+
+  for (my $i=0; $i<@v; $i+=2) {
+    my $integer_weight=$v[$i];
+    my $value=$v[$i+1];
+    for (my $j=0; $j<$integer_weight; $j++) {
+      push @vp, $value;
+    }
+  }
+  return average(@vp);
+}
+
 # returns undef if there are no inputs, and ignores inputs that are
 # undef
 sub max {
@@ -92,14 +190,114 @@ sub max {
   return $max;
 }
 
+my %hdd_cache_temp;
+my %hdd_cache_time;
+# FIXME: should we use /usr/local/bin/megaclisas-status for all temps?  How does it handle drives in sleep mode?
+sub hddtemp {
+  my ($device)=(@_);
+
+  # FIXME: if user supplies a parameter of the form of [32:13], interpret it as "Slot ID" form output by megaclisas-status
+  return if ! -e $device;
+
+  if (!defined $hdd_cache_time{$device} or
+      $hdd_cache_time{$device} > $hdd_poll_interval) {
+    # could just be a simple pipe, but hddtemp has a strong posibility
+    # to be stuck in a D state, and hold STDERR open despite a kill
+    # -9, so instead just send it to a tempfile, and read from that tempfile
+
+    # Some HDDs will be spun down, so they return "not available".
+    # Treat them as if they weren't there.
+    system("timeout -k 1 20 /usr/local/bin/hddtemp --no-device --numeric $device | grep -v 'not available' > $tempfilename");
+
+    my $val = `cat < $tempfilename`; chomp $val;
+    if ($val ne "") {
+      $hdd_cache_temp{$device} = $val;
+      $hdd_cache_time{$device} = time;
+    }
+  }
+
+  return $hdd_cache_temp{$device};
+}
+
+my $raid_controller_cache_temp;
+my $raid_controller_cache_time;
+sub raid_controller_temp {
+  if (!defined $raid_controller_cache_time or
+      $raid_controller_cache_time > $raid_controller_poll_interval) {
+    # could just be a simple pipe, but protect against something
+    # getting stuck in the D state, holding STDERR open despite a kill
+    # -9, so instead just send it to a tempfile, and read from that
+    # tempfile
+    system("timeout -k 1 20 /opt/MegaRAID/MegaCli/MegaCli64 -AdpAllInfo -aALL | grep -i ^ROC.temperature | awk '{print \$4}' > $tempfilename");
+
+    my $val = `cat < $tempfilename`; chomp $val;
+    if ($val ne "") {
+      $raid_controller_cache_temp = $val;
+      $raid_controller_cache_time = time;
+    }
+  }
+
+  return $raid_controller_cache_temp;
+}
+
+my $ambient_cache_temp = 20;
+my $ambient_cache_time;
+sub ambient_temp {
+  if (!defined $ambient_cache_time or
+      $ambient_cache_time > $ambient_poll_interval) {
+    system("timeout -k 1 20 ipmitool sdr type temperature | grep '$ipmi_inlet_sensorname' | grep [0-9] > $tempfilename");
+
+    my @ambient_ipmitemps = `cat < $tempfilename`;
+    # apply from List::MoreUtils
+    @ambient_ipmitemps = apply { s/.*\| ([^ ]*) degrees C.*/$1/ } @ambient_ipmitemps;
+
+    if (@ambient_ipmitemps) {
+      # ipmitool often fails - just keep using the previous result til
+      # it succeeds
+      $ambient_cache_temp = average(@ambient_ipmitemps);
+      $ambient_cache_time = time;
+    }
+  }
+
+  return $ambient_cache_temp;
+}
+
+my $exhaust_cache_temp = 30;
+my $exhaust_cache_time;
+sub exhaust_temp {
+  if (!defined $exhaust_cache_time or
+      $exhaust_cache_time > $exhaust_poll_interval) {
+    system("timeout -k 1 20 ipmitool sdr type temperature | grep '$ipmi_exhaust_sensorname' | grep [0-9] > $tempfilename");
+
+    my @exhaust_ipmitemps = `cat < $tempfilename`;
+    # apply from List::MoreUtils
+    @exhaust_ipmitemps = apply { s/.*\| ([^ ]*) degrees C.*/$1/ } @exhaust_ipmitemps;
+
+    if (@exhaust_ipmitemps) {
+      # ipmitool often fails - just keep using the previous result til
+      # it succeeds
+      $exhaust_cache_temp = average(@exhaust_ipmitemps);
+      $exhaust_cache_time = time;
+    }
+  }
+
+  return $exhaust_cache_temp;
+}
+
 sub set_fans_default {
   if (!defined $current_mode or $current_mode ne "default") {
     $current_mode="default";
     $lastfan=undef;
-    print "--> enable dynamic fan control\n";
+    # this is an abnormal condition, so always warn about it, even in
+    # quiet mode
+    print "--> enable dynamic (idrac automatic) fan control\n";
     foreach my $attempt (1..10) {
-      system("ipmitool raw 0x30 0x30 0x01 0x01") == 0 and return 1;
-      sleep 1;
+      # ipmitool routinely fails, so try up to 10 times since we are
+      # already the failure path, so need to be reliable ourselves
+      if (system("ipmitool raw 0x30 0x30 0x01 0x01") == 0) {
+        return 1;
+      }
+      sleep_and_check_for_exit 1;
       print "  Retrying dynamic control $attempt\n";
     }
     print "Retries of dynamic control all failed\n";
@@ -109,37 +307,29 @@ sub set_fans_default {
 }
 
 sub set_fans_servo {
-  my ($ambient_temp, $_cputemps, $_coretemps, $_hddtemps) = (@_);
-  my (@cputemps)  = @$_cputemps;
-  my (@coretemps) = @$_coretemps;
-  my (@hddtemps)  = @$_hddtemps;
-
-  # two thirds weighted CPU temps vs hdd temps, but if the HDD temps
-  # creep above this value, use them exclusively (more important to
-  # keep them cool than the CPUs)
-  my $weighted_temp = max(average(
-                                  average(@cputemps), average(@coretemps), average(@hddtemps)),
-                          average(@hddtemps));
+  my $weighted_temp = custom_temperature_calculation();
 
   if ((!defined $weighted_temp) or ($weighted_temp == 0)) {
     print "Error reading all temperatures! Fallback to idrac control\n";
     set_fans_default();
-    return;
+    return 0;  # we always failed, even if set_fans_default succeeded
   }
-  print "weighted_temp = $weighted_temp ; ambient_temp $ambient_temp\n" if $print_stats;
+  # my $ambient_temp = ambient_temp();
+  # print "weighted_temp($fans) = $weighted_temp ; ambient_temp $ambient_temp\n" if $print_stats;
+  my $exhaust_temp = exhaust_temp();
+  print "weighted_temp($fans) = $weighted_temp ; exhaust_temp $exhaust_temp\n" if $print_stats;
 
+  # take us out of idrac dynamic control, setting to manual control
   if ((!defined $current_mode) or ($current_mode ne "set")) {
     print "--> disable dynamic fan control\n" if !($quiet and (defined $current_mode) and ($current_mode eq "reset"));
-    system("ipmitool raw 0x30 0x30 0x01 0x00") == 0 or return 0;
-    # if this fails, want to return telling caller not to think weve
-    # made a change
+    # ipmitool routinely fails; that's OK, if this fails, want to
+    # return telling caller not to think we've made a change
+    if (system("ipmitool raw 0x30 0x30 0x01 0x00") != 0) {
+      return 0;
+    }
     $current_mode="set";
   }
 
-  # FIXME: probably want to take into account ambient temperature - if
-  # the difference between weighted_temp and ambient_temp is small
-  # because ambient_temp is large, then less need to run the fans
-  # because there's still low power demands
   my $demand = 0; # sort of starts off with a range roughly 0-255,
                   # which we multiply later to be ranged roughly
                   # between 0-100% of
@@ -163,7 +353,7 @@ sub set_fans_servo {
     # the only possibility left is $weighted_temp < $base_temp
     # which we've already decided is demand=0
   }
-  printf "demand(%0.2f)", $demand if $print_stats;
+  printf "demand($fans, %0.2f)", $demand if $print_stats;
   $demand = int($static_speed_low + $demand/100*($static_speed_high-$static_speed_low));
   if ($demand>255) {
     $demand=255;
@@ -172,113 +362,176 @@ sub set_fans_servo {
   # ramp down the fans quickly upon lack of demand, don't ramp them up
   # to tiny spikes of 1 fan unit.  FIXME: But should implement long
   # term smoothing of +/- 1 fan unit
-  if (!defined $lastfan or $demand < $lastfan or $demand > $lastfan + $hysteresis) {
+  if (!defined $lastfan or
+      $demand < $lastfan or
+      $demand > $lastfan + $hysteresis) {
     $lastfan = $demand;
     $demand = sprintf("0x%x", $demand);
-#    print "demand = $demand\n";
-    print "--> ipmitool raw 0x30 0x30 0x02 0xff $demand\n";
-    system("ipmitool raw 0x30 0x30 0x02 0xff $demand") == 0 or return 0;
-    # if this fails, want to return telling caller not to think weve
-    # made a change
+    # print "demand = $demand\n";
+    print "--> ipmitool raw 0x30 0x30 0x02 $fans $demand\n";
+    # ipmitool routinely fails; that's OK, if this fails, want to
+    # return telling caller not to think we've made a change
+    if (system("ipmitool raw 0x30 0x30 0x02 $fans $demand") != 0) {
+      return 0;
+    }
   }
   return 1;
 }
 
-my ($tempfh, $tempfilename) = tempfile("poweredge-fand.XXXXX", TMPDIR => 1);
+my $parent_pid=$$;
 
-$SIG{TERM} = $SIG{HUP} = $SIG{INT} = sub { my $signame = shift ; $SIG{$signame} = 'DEFAULT' ; print "Resetting fans back to default\n"; set_fans_default ; kill $signame, $$ };
+sub we_are_parent {
+  return ($$ == $parent_pid);
+}
+
+# from man perlipc
+sub child_handler {
+  # don't change $! and $? outside handler
+  local ($!, $?);
+  while ( (my $pid = waitpid(-1, WNOHANG)) > 0 ) {
+    delete $children{$pid};
+    # cleanup_child($pid, $?);
+  }
+};
+
+sub signal_handler {
+  $signame = shift;
+  print "poweredge-fand(", (we_are_parent() ? "" : "$parent_pid -> " ), "$$): Recieved signal $signame\n";
+  $SIG{$signame} = "DEFAULT";
+  exit;
+};
 END {
+  # handler for internal errors (floating point, die, etc) that don't
+  # cause signals
   my $exit = $?;
-  unlink $tempfilename;
-  print "Resetting fans back to default\n";
-  set_fans_default;
-  $? = $exit;
-}
-
-if (defined $ARGV[0] && $ARGV[0] eq "-q") {
-  $quiet=1;
-  $print_stats=0;
-}
-
-my $last_reset_hddtemps=time;
-my $last_reset_ambient_ipmitemps=time;
-my $ambient_temp=20;
-while () {
-  if (!@hddtemps) {
-    # could just be a simple pipe, but hddtemp has a strong posibility
-    # to be stuck in a D state, and hold STDERR open despite a kill
-    # -9, so instead just send it to a tempfile, and read from that tempfile
-    system("timeout -k 1 20 hddtemp /dev/sd? /dev/nvme?n? | grep -v 'not available' > $tempfilename");
-    @hddtemps=`cat < $tempfilename`;
-  }
-  if (!@ambient_ipmitemps) {
-    @ambient_ipmitemps=`timeout -k 1 20 ipmitool sdr type temperature | grep "$ipmi_inlet_sensorname" | grep [0-9] || echo " | $ambient_temp degrees C"` # ipmitool often fails - just keep using the previous result til it succeeds
-  }
-  @coretemps=`timeout -k 1 20 sensors | grep [0-9]`;
-  @cputemps=grep {/^Package id/} @coretemps;
-  @coretemps=grep {/^Core/} @coretemps;
-  # filter in numbers only and remove all extraneous output, and some
-  # devices permanently return a *temperature* of 255, so filter them
-  # out too.
-  @hddtemps=grep {/[0-9]/ && !/255/} @hddtemps;
-
-  chomp @cputemps;
-  chomp @coretemps;
-  chomp @ambient_ipmitemps;
-  chomp @hddtemps;
-
-  # apply from List::MoreUtils
-
-  # "..?C" refers to single octet ascii degree symbol that old
-  # versions used to output, and 2 octet unicode degree symbol
-  @cputemps = apply { s/.*:  *([-+0-9.]+)..?C\b.*/$1/ } @cputemps;
-  @coretemps = apply { s/.*:  *([-+0-9.]+)..?C\b.*/$1/ } @coretemps;
-  @ambient_ipmitemps = apply { s/.*\| ([^ ]*) degrees C.*/$1/ } @ambient_ipmitemps;
-  @hddtemps = apply { s/.*:  *([-+0-9.]+)..?C\b.*/$1/ } @hddtemps;
-  #FIXME: it is more important to keep hdds cool than CPUs.  We should
-  #put differnt offsets on them - possibly as easily as adding "10" to
-  #hddtemp (but need to work out how to keep log output sane)
-
-  print "\n" if $print_stats;
-
-  print "cputemps=", join (" ; ", @cputemps), "\n" if $print_stats;
-  print "coretemps=", join (" ; ", @coretemps), "\n" if $print_stats;
-  print "ambient_ipmitemps=", join (" ; ", @ambient_ipmitemps), "\n" if $print_stats;
-  print "hddtemps=", join (" ; ", @hddtemps), "\n" if $print_stats;
-
-  $ambient_temp = average(@ambient_ipmitemps);
-  # FIXME: hysteresis
-  if ($ambient_temp > $default_threshold) {
-    print "fallback because of high ambient temperature $ambient_temp > $default_threshold\n";
-    if (!set_fans_default()) {
-      # return for next loop without resetting timers and delta change if that fails
-      next;
+  if (we_are_parent()) {
+    if ($started) {
+      # we're the parent, and need to kill all our children and reset
+      # fans back to default
+      my (@children) = keys %children;
+      print "Killing children: @children\n";
+      kill "TERM", @children;
+      my $children_left;
+      for my $checks (1..100) {
+        if ( (my $pid = waitpid(-1, WNOHANG)) > 0) {
+          delete $children{$pid};
+          (@children) = keys %children;
+        }
+        $children_left = kill 0, @children;
+        if ($children_left) {
+          print "Still waiting for $children_left children to die: @children\n"
+        } else {
+          last;
+        }
+        sleep 0.03
+      }
+      if ($children_left) {
+        print "Not all children died. $children_left children were left, which may contain: @children\n"
+      }
+      print "Resetting fans back to default\n";
+      my $saved_signame=$signame;
+      $signame=undef;
+      set_fans_default;
+      $signame=$saved_signame;
     }
   } else {
-    if (!set_fans_servo($ambient_temp, \@cputemps, \@coretemps, \@hddtemps)) {
-      # return for next loop without resetting timers and delta change if that fails
-      next;
+    # we're a child daemon, and need to unlink our temporary file
+    unlink $tempfilename if defined $tempfilename;
+    print "Child fan $fans dying: $$\n";
+  }
+  if ($signame) {
+    $SIG{$signame} = "DEFAULT";
+    kill $signame, $$;
+    exit 130;  # fallback since seems to be ignoring SIGINT
+  } else {
+    $? = $exit;
+  }
+}
+
+my $conf_file="/etc/poweredge-fand.conf";
+
+while (@ARGV > 0) {
+  if ($ARGV[0] eq "-q") {
+    $quiet=1;
+    $print_stats=0;
+  } elsif ($ARGV[0] eq "-f") {
+    $conf_file=$ARGV[1];
+    shift @ARGV;
+  } else {
+    print_usage;
+  }
+  shift @ARGV;
+}
+
+include($conf_file);
+$started=1;
+$SIG{TERM} = $SIG{HUP} = $SIG{INT} = \&signal_handler;
+
+foreach my $loop_fan (@daemons) {
+  my $pid;
+  if ($pid=fork) {
+    #parent;
+    $children{$pid}=1;
+    # keep looping
+  } elsif ($pid==0) {
+    #child;
+    $fans=$loop_fan;
+    print "Forked child $parent_pid -> $$ for fan $fans\n";
+    last;
+  } else {
+    die "could not fork: #!";
+  }
+}
+
+# if we are the parent, wait for the first child to die, then kill all
+# our children (or just delegate the killing to systemd?)
+if (we_are_parent()) {
+  $SIG{CHLD} = \&child_handler;
+  wait;   # wait for the first child to die, then exit, killing all
+          # the rest (to signal to systemd that we died)
+
+  print "One of our children died with $?, so we're exiting\n";
+  exit $?;
+}
+
+my $tempfh;
+($tempfh, $tempfilename) = tempfile("poweredge-fand.temp.XXXXX", TMPDIR => 1);
+
+my $last_print_stats=time;
+while () {
+  my $sensors_json = `timeout -k 1 20 sensors -j 2>/dev/null`;  # discard errors, annoyingly, but we do need to suppress things like
+                                                                # "ERROR: Can't get value of subfeature fan1_input: Can't read"
+
+  $sensors_ref = decode_json $sensors_json;
+
+  # my $ambient_temp = ambient_temp();
+  # if ($ambient_temp > $default_threshold) {
+  my $exhaust_temp = exhaust_temp();
+  if ($exhaust_temp > $default_exhaust_threshold) {
+    #print "fallback because of high ambient temperature $ambient_temp > $default_threshold\n";
+    print "fallback because of high exhaust temperature $exhaust_temp > $default_exhaust_threshold\n";
+    if (!set_fans_default()) {
+      # return for next loop without resetting timers and delta change
+      # if that fails
+      goto nextpoll;
+    }
+  } else {
+    if (!set_fans_servo()) {
+      # return for next loop without resetting timers and delta change
+      # if that fails
+      goto nextpoll;
     }
   }
 
   $print_stats = 0;
-  # every 20 minutes (enough to establish spin-down), invalidate the
-  # cache of the slowly changing hdd temperatures to allow them to be
-  # refreshed
-  if (time - $last_reset_hddtemps > 1200) {
-    @hddtemps=();
-    $last_reset_hddtemps=time;
-  }
-  # every 60 seconds, invalidate the cache of the slowly changing
-  # ambient temperatures to allow them to be refreshed
-  if (time - $last_reset_ambient_ipmitemps > 60) {
-    @ambient_ipmitemps=();
+  if (time - $last_print_stats > 60) {
     $current_mode="reset"; # just in case the RAC has rebooted, it
                            # will go back into default control, so
                            # make sure we set it appropriately once
                            # per minute
-    $last_reset_ambient_ipmitemps=time;
+    $last_print_stats=time;
     $print_stats = 1 if !$quiet;
   }
-  sleep 3;
+ nextpoll:
+  sleep_and_check_for_exit $cpu_poll_interval;
 }

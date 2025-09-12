@@ -1,4 +1,4 @@
-# fan speed controller for Dell Poweredge R710, R520, R730xd etc
+# Fan speed controller for Dell Poweredge R710, R520, R730xd etc
 
 Dells don't like having third party cards installed, and defaults to
 ramping up the fan speed to "jetliner taking off" mode when some third
@@ -8,9 +8,9 @@ be.  But for more flexibility or if you've added a particularly hot
 10gbe card and want to cool it more effectively, you can override all
 of this with this repo.  Here, we servo the fans to follow the
 temperature demand of the various components (disks via hddtemp, CPUs
-and GPUs via sensors, ambient temperature via ipmitool).  Tuning is
-alas done entirely by you modifying variable of devices to monitor in
-code, alas.
+and GPUs via sensors, ambient and exhaust temperatures via ipmitool).
+Tuning is alas done entirely by you modifying variable of devices to
+monitor in code, alas.
 
 This repo is forked from
 [NoLooseEnds/Scripts](https://github.com/NoLooseEnds/Scripts),
@@ -41,7 +41,7 @@ drives and NVME drives via a forked [munin-smart-nvme
 repo](https://github.com/spacelama/munin-smart-nvme), munging them
 into the same format (and subject to the same spindown tests).
 
-# installation (debian/proxmox)
+# Installation (debian/proxmox)
 
 This repo is included via my [ansible
 module](https://github.com/spacelama/ansible-initial-server-setup/tree/master/roles/dell_server)
@@ -54,6 +54,7 @@ sudo apt install liblist-moreutils-perl lm-sensors ipmitool
 sudo apt remove hddtemp
 
 sudo cp -p poweredge-fand.pl /usr/local/bin && sudo chmod 755 /usr/local/bin/poweredge-fand.pl
+sudo cp -p poweredge-fand.conf /etc
 sudo cp -p hddtemp smart-intercept-spindown smartctlnvme /usr/local/bin/ && sudo chmod 755 /usr/local/bin/{hddtemp,smart-intercept-spindown,smartctlnvme}
 sudo cp -p poweredge-fand.service /etc/systemd/system/poweredge-fand.service
 sudo systemctl daemon-reload
@@ -63,14 +64,22 @@ sudo systemctl --now enable poweredge-fand.service
 [Reddit discussion](https://www.reddit.com/r/homelab/comments/ed6w7y)
 
 # Possibly required modifications/tuning
-The code's configuration is in the script, unfortunately.  It's also
-configured for my *specific* R730XD's in my specific climate with my
-specific drives and tolerance for noise.  This code comes with no
-warranty - you are expected to both tune it, and monitor for possible
-failures or things being too hot.  For the R710, you'll probably need
-to modify the regexps looking for "Inlet Temp" to whatever's your
-version of ambient air temperature - you might need to anchor the text
-since it's only using grep to filter the results.
+The code's configuration is in poweredge-fand.conf, which is set to
+match my *specific* R730XD's in my specific climate with my specific
+drives and tolerance for noise.  This code comes with no warranty -
+you are expected to both tune it, and monitor for possible failures or
+things being too hot.  There is a signal handler such that if there's
+an unexpected condition for any one of the calculations for any of the
+fans, then the entire daemon should die (and potentially restart
+depending on your systemd configuration) falling back to default iDrac
+control, to alert you that something has gone wrong, do no worse than
+Dell factory configured your machine, and to not leave your machine in
+an undefined state with one or several fans out of action and the
+others picking up the slack obscuring the fact that things are not
+operating properly.  For the R710, you'll probably need to modify the
+regexps looking for "Inlet Temp" or "Exhaust Temp" to whatever's your
+version of ambient/exhaust air temperature - you might need to anchor
+the text since it's only using grep to filter the results.
 
 You might want to modify setpoints and thresholds.  $demand isn't
 actually a percentage. That code is a mess, $static_speed_high is more
@@ -117,7 +126,7 @@ Jan 03 02:59:23 pve1 poweredge-fand.pl[3648151]: --> disable dynamic fan control
 > sensors
 > sudo hddtemp /dev/sd?
 ```
-Whatever.  Note that hddtemps and inlet (ambient air *intake*, which
+Whatever.  Note that hddtemps and inlet/exhaust (inlet is ambient air *intake*, which
 measures your room temperature) temperature are polled less frequently
 than coretemps, given they don't change as rapidly and are more expensive
 to read.
@@ -134,11 +143,11 @@ content.  I use it to keep the fans low but increasing to a soft
 volume up to 40 degrees, ramp it up quickly to 50degrees, then very
 quickly towards full speed much beyond that.  It also has an ambient
 air temperature threshold of 32degrees where it gives up and delegates
-control back to the firmware.  The ambient temperature reading doesn't
-normally affect how hard your fans have to spin, and is only used to
-fallback to iDRAC mode so that your machine doesn't explode if eg., you've
-had an air-conditioning failure.  Don't run your bedroom IT closet at 32
-degrees yeah?
+control back to the firmware.  The ambient and exhaust temperature
+readings don't normally affect how hard your fans have to spin, and
+is only used to fallback to iDRAC mode so that your machine doesn't
+explode if eg., you've had an air-conditioning failure.  Don't run
+your bedroom IT closet at 32 degrees yeah?
 
 # Results
 
