@@ -81,6 +81,18 @@ regexps looking for "Inlet Temp" or "Exhaust Temp" to whatever's your
 version of ambient/exhaust air temperature - you might need to anchor
 the text since it's only using grep to filter the results.
 
+The config file as is, looks for specific devices I have plugged into
+my R730xd - such as "amdgpu-pci-0400".  If it doesn't find them, it
+will crash as it tries to dereference json structures that don't
+exist.  But once you've successfully gotten it to start without
+crashing, because you've inspected `sensors -j` yourself and inserted
+your relevant hardware into the calculations within
+poweredge-fand.conf, then any further tuning can be done by modifying
+the config file without having to restart (until you introduce a
+syntax error in the conf file that causes the code to bail out with a
+syntax error - you'll notice the effects almost immediately as the
+fans fallback to their default Dell iDrac behaviour).
+
 You might want to modify setpoints and thresholds.  $demand isn't
 actually a percentage. That code is a mess, $static_speed_high is more
 or less arbitrary - the initial ramps are chosen to sort of scale from

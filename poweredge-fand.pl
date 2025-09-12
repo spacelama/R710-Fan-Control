@@ -81,6 +81,7 @@ sub print_usage {
   exit 1;
 }
 
+my %included_conf_file;
 sub include {
   # http://www.perlmonks.org/?node_id=393426
   #package DB;     # causes eval to evaluate the string in the caller's
@@ -98,7 +99,12 @@ sub include {
   $code = qq[#line 1 "$filename"\n] .
     $code;
   #  print "evaling code: $code\n";
-  eval $code;
+  if (!defined $included_conf_file{$filename}
+      or $included_conf_file{$filename} ne $code) {
+    print "(re)Parsing file $filename\n";
+    eval $code;
+    $included_conf_file{$filename} = $code;
+  }
   if ("$@" ne "") {
     die "Can't eval $filename: $@";
   }
@@ -172,7 +178,9 @@ sub weighted_average {
       push @vp, $value;
     }
   }
-  return average(@vp);
+  my $a = average(@vp);
+  # print "weighted average @v -> @vp -> $a\n";
+  return $a;
 }
 
 # returns undef if there are no inputs, and ignores inputs that are
@@ -463,7 +471,7 @@ while (@ARGV > 0) {
   shift @ARGV;
 }
 
-include($conf_file);
+include $conf_file;
 $started=1;
 $SIG{TERM} = $SIG{HUP} = $SIG{INT} = \&signal_handler;
 
@@ -499,6 +507,10 @@ my $tempfh;
 
 my $last_print_stats=time;
 while () {
+  # Let's parse the file everytime, and detect changes, so we can
+  # quickly debug new curves without waiting for the restart sequence:
+  include $conf_file;
+
   my $sensors_json = `timeout -k 1 20 sensors -j 2>/dev/null`;  # discard errors, annoyingly, but we do need to suppress things like
                                                                 # "ERROR: Can't get value of subfeature fan1_input: Can't read"
 
