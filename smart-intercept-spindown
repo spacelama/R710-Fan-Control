@@ -98,14 +98,14 @@ if [ "1" = --version ] ; then
     exec smartctl "$@"
 fi
 
-if sdparm --command=sense "$final_arg" 2>/dev/null | grep Standby; then
+if sdparm --command=sense "$final_arg" 2>/dev/null | grep -e "Standby condition" -e "Idle condition" ; then
     # exit code success rather than code 2 like smartctl by default
     # Could do similar output with hdparm -C, but smartctl
     # --nocheck=standby,0 correctly detects that
     exit
 fi
 
-smart_output=$( smartctl --nocheck=standby,0 "$@" )
+smart_output=$( smartctl --nocheck=idle,0 "$@" )
 exit_code=$?
 
 case "$smart_output" in

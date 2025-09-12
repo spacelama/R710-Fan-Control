@@ -20,30 +20,70 @@ use warnings;
 
 $ENV{PATH}="$ENV{PATH}:/usr/sbin:/sbin";
 
+sub usage {
+  print STDERR "@_\n" if @_;
+  print STDERR "Usage: hddtemp [-n|--numeric] [--no-device] <devices>\n";
+  exit 1;
+}
+
+# FIXME: consider using megaclisas-status if it's available, although
+# finding the mapping might be interesting...
+
+my $units="°C";
+my $print_device=1;
+while (@ARGV and $ARGV[0] =~ /^-/) {
+  if ($ARGV[0] eq "--numeric" or $ARGV[0] eq "-n") {
+    shift @ARGV;
+    $units="";
+  } elsif ($ARGV[0] eq "--no-device") {
+    shift @ARGV;
+    $print_device=0;
+  } else {
+    usage;
+  }
+}
+
+usage "Supply device name(s)" if (!@ARGV);
+
 my $last_exit=0;
 foreach my $drive (@ARGV) {
   my $output=`/usr/local/bin/smart-intercept-spindown -A -i $drive`;
   $last_exit = $?>>8;
-  if (!($output =~ /Standby condition/)) {
-    my $model="";
+  if (!($output =~ /(Standby|Idle) condition/)) {
+    my $model = "";
+    my $temp  = "";
     if ($output =~ /(Model Number|Device Model):\s*(.*)/) {
-      $model="$2: ";
+      $model = "$2: ";
     }
+
     if ($output =~ /Current Drive Temperature:\s*(\d+)/) {
-      print "$drive: $model$1°C\n";
+      $temp = $1;
     } elsif ($output =~ /^(194 Temperature_(Celsius|Internal).*)/m) {
       my @F = split /\s+/, $1;
-      print "$drive: $model$F[9]°C\n";
+      $temp = $F[9];
     } elsif ($output =~ /^(231 Temperature_Celsius.*)/m) {
       my @F = split ' ', $1;
-      print "$drive: $model$F[9]°C\n";
+      $temp = $F[9];
     } elsif ($output =~ /^(190 (Airflow_Temperature_Cel|Temperature_Case).*)/m) {
       my @F = split ' ', $1;
-      print "$drive: $model$F[9]°C\n";
+      $temp = $F[9];
     } elsif ($output =~ /Temperature:\s*(\d+) Celsius/) {
-      print "$drive: $model$1°C\n";
+      $temp = $1;
     } else {
-      print "$drive: Smart not available\n";
+      print "$drive: SMART not available\n";
+      next;
+    }
+
+    # Some devices permanently return a *temperature* of 255, so
+    # ignore them too
+    if ($temp == 255) {
+      print "$drive: ${model}Temperature not available through SMART\n";
+    } else {
+      if ($print_device) {
+        print "$drive: $model$temp$units\n";
+      } else {
+        print "$temp$units\n";
+      }
     }
   } else {
     print "$drive: Sleeping.  Temperature not available\n";
