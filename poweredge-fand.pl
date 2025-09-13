@@ -20,24 +20,24 @@ use POSIX ":sys_wait_h"; # for nonblocking read
 use Time::HiRes qw (sleep);
 
 my $static_speed_low;
-my $static_speed_high;   # this is the speed value at 100% demand
+my $static_speed_high;   # This is the speed value at 100% demand
                          # ie what we consider the point we don't
                          # really want to get hotter but still
                          # tolerate
 my ($ipmi_inlet_sensorname, $ipmi_exhaust_sensorname);
 
-my $default_exhaust_threshold; # the exhaust temperature we use above
-                               # which we fail back to letting the drac
-                               # control the fans
-my $base_temp;           # no fans when below this temp
-my $desired_temp1;       # aim to keep the temperature below this
-my $desired_temp2;       # really ramp up fans above this
-my $desired_temp3;       # really ramp up fans above this
-my $demand1;             # prescaled (not taking into effect static_speed_low/high) demand at temp1
-my $demand2;             # prescaled (not taking into effect static_speed_low/high) demand at temp2
-my $demand3;             # prescaled (not taking into effect static_speed_low/high) demand at temp3
+my $default_exhaust_threshold; # The exhaust temperature we use, set
+                               # from above, which we fail back to
+                               # letting the drac control the fans
+my $base_temp;           # No fans when below this temp
+my $desired_temp1;       # Aim to keep the temperature below this
+my $desired_temp2;       # Really ramp up fans above this
+my $desired_temp3;       # Really ramp up fans above this
+my $demand1;             # Prescaled (not taking into effect static_speed_low/high) demand at temp1
+my $demand2;             # Prescaled (not taking into effect static_speed_low/high) demand at temp2
+my $demand3;             # Prescaled (not taking into effect static_speed_low/high) demand at temp3
 
-my $hysteresis;          # don't ramp up velocity unless demand
+my $hysteresis;          # Don't ramp up velocity unless demand
                          # difference is greater than this.  Ramp
                          # down ASAP however, to bias quietness, and
                          # thus end up removing noise changes for
@@ -48,17 +48,20 @@ my $fans;                # which fans are being controlled by this daemon?  0xff
 
 sub custom_temperature_calculation;
 
-# every 20 minutes (enough to establish spin-down), invalidate the
+# Every 20 minutes (enough to establish spin-down), invalidate the
 # cache of the slowly changing hdd temperatures to allow them to be
 # refreshed
 my $hdd_poll_interval=1200;
-# raid controller is less expensive to poll, and should't change
+# Raid controller is less expensive to poll, but also should't change
 # overly rapidly
 my $raid_controller_poll_interval=30;
-# every 60 seconds, invalidate the cache of the slowly changing
+# Every 60 seconds, invalidate the cache of the slowly changing
 # ambient temperatures to allow them to be refreshed
 my $ambient_poll_interval=60;
 my $exhaust_poll_interval=60;
+# And put fan back under our control once per minute if someone
+# slipped it back into idrac mode, if all conditions are correct
+my $manual_mode_reset_interval=60;
 my $cpu_poll_interval=3;
 
 my $sensors_ref;
@@ -83,9 +86,14 @@ sub print_usage {
 
 my %included_conf_file;
 sub include {
-  # http://www.perlmonks.org/?node_id=393426
-  #package DB;     # causes eval to evaluate the string in the caller's
-  # scope.  Sometimes perl can be truly horrendous
+  # http://www.perlmonks.org/?node_id=393426 but a bit different to
+  # the version you can see there now in 2025, or maybe this was the
+  # version I found that works when you're not trying to write a
+  # module...?  Their code wants &include to be defined as
+  # &module::include, and circa 2025, I was now seeing scope issues
+  # without that, but removed `package DB; # causes eval to evaluate
+  # the string in the caller's scope` and the code started to work
+  # again.  So let's go with that...
   my ($filename) = @_;
 
   my $code;
@@ -126,11 +134,18 @@ sub sleep_and_check_for_exit {
   }
 }
 
+# Only test true in one of the daemons, for the first fan (or the
+# daemon that's controlling all fans simultaneously)
+sub perform_only_once {
+  return ($fans == 0 or $fans == 0xff);
+}
+
 # Only print out the stats in one of the daemons, for the first
 # fan (or the daemon that's controlling all fans simultaneously)
 sub print_stats_once {
-  return $print_stats and
-    ($fans == 0 or $fans == 0xff);
+  my $res=($print_stats and
+    perform_only_once());
+  return $res;
 }
 
 sub is_num {
@@ -298,7 +313,11 @@ sub set_fans_default {
     $lastfan=undef;
     # this is an abnormal condition, so always warn about it, even in
     # quiet mode
-    print "--> enable dynamic (idrac automatic) fan control\n";
+    if (perform_only_once) {
+      print " --> enable dynamic (idrac automatic) fan control\n";
+    }
+    # any one of the daemons is allowed to independently call
+    # set_fans_default, so we have to run it for each of them:
     foreach my $attempt (1..10) {
       # ipmitool routinely fails, so try up to 10 times since we are
       # already the failure path, so need to be reliable ourselves
@@ -322,14 +341,27 @@ sub set_fans_servo {
     set_fans_default();
     return 0;  # we always failed, even if set_fans_default succeeded
   }
-  # my $ambient_temp = ambient_temp();
-  # print "weighted_temp($fans) = $weighted_temp ; ambient_temp $ambient_temp\n" if $print_stats;
+  my $ambient_temp = ambient_temp();
   my $exhaust_temp = exhaust_temp();
-  print "weighted_temp($fans) = $weighted_temp ; exhaust_temp $exhaust_temp\n" if $print_stats;
+  print "ambient_temp $ambient_temp ; exhaust_temp $exhaust_temp" if print_stats_once;
 
-  # take us out of idrac dynamic control, setting to manual control
-  if ((!defined $current_mode) or ($current_mode ne "set")) {
-    print "--> disable dynamic fan control\n" if !($quiet and (defined $current_mode) and ($current_mode eq "reset"));
+  # All fan controllers have to agree to take the fan control out of
+  # idrac control (or, more correctly, any of the controllers can put
+  # it back into auto-mode), so we only do the manual invocation from
+  # one of the controllers, in order not to flood the logs and run
+  # ipmitool more often than necessary (the reset is done once per
+  # minute anyway if someone did slip it back into idrac control, but
+  # then didn't have the authority to move it back under manual
+  # control)
+  if (perform_only_once) {
+    if ((!defined $current_mode) or ($current_mode ne "set")) {
+      if ($print_stats or
+          !((defined $current_mode) and ($current_mode eq "reset"))) {
+         print " --> enable our manual fan control\n";
+      }
+    } else {
+      print "\n" if $print_stats;
+    }
     # ipmitool routinely fails; that's OK, if this fails, want to
     # return telling caller not to think we've made a change
     if (system("ipmitool raw 0x30 0x30 0x01 0x00") != 0) {
@@ -337,7 +369,6 @@ sub set_fans_servo {
     }
     $current_mode="set";
   }
-
   my $demand = 0; # sort of starts off with a range roughly 0-255,
                   # which we multiply later to be ranged roughly
                   # between 0-100% of
@@ -361,22 +392,31 @@ sub set_fans_servo {
     # the only possibility left is $weighted_temp < $base_temp
     # which we've already decided is demand=0
   }
-  printf "demand($fans, %0.2f)", $demand if $print_stats;
-  $demand = int($static_speed_low + $demand/100*($static_speed_high-$static_speed_low));
-  if ($demand>255) {
-    $demand=255;
+
+  my $demand_out = int($static_speed_low + $demand/100*($static_speed_high-$static_speed_low));
+  if ($demand_out>255) {
+    $demand_out=255;
   }
-  printf " -> %i\n", $demand if $print_stats;
+  my $stats_to_print=sprintf "weighted_temp($fans) = %6.2f ; demand($fans)=%6.2f -> %3i", $weighted_temp, $demand, $demand_out;
+  $demand = $demand_out;
+
   # ramp down the fans quickly upon lack of demand, don't ramp them up
   # to tiny spikes of 1 fan unit.  FIXME: But should implement long
   # term smoothing of +/- 1 fan unit
-  if (!defined $lastfan or
-      $demand < $lastfan or
-      $demand > $lastfan + $hysteresis) {
-    $lastfan = $demand;
-    $demand = sprintf("0x%x", $demand);
+  my $demand_has_changed = !defined $lastfan or
+    $demand < $lastfan or
+    $demand > $lastfan + $hysteresis;
+  if ($print_stats or
+      $demand_has_changed) {
+    if ($demand_has_changed) {
+      $lastfan = $demand;
+    }
+    $demand = sprintf("0x%02x", $demand);
     # print "demand = $demand\n";
-    print "--> ipmitool raw 0x30 0x30 0x02 $fans $demand\n";
+
+    # allowed to print out of minute-printing cycle if the demand
+    # actually changes
+    print "$stats_to_print --> ipmitool raw 0x30 0x30 0x02 $fans $demand\n";
     # ipmitool routinely fails; that's OK, if this fails, want to
     # return telling caller not to think we've made a change
     if (system("ipmitool raw 0x30 0x30 0x02 $fans $demand") != 0) {
@@ -475,11 +515,17 @@ include $conf_file;
 $started=1;
 $SIG{TERM} = $SIG{HUP} = $SIG{INT} = \&signal_handler;
 
+my $first_child=1;
 foreach my $loop_fan (@daemons) {
   my $pid;
   if ($pid=fork) {
     #parent;
     $children{$pid}=1;
+    if ($first_child) {
+      sleep 20;  # give time for the first daemon to gather all
+                 # ambient, hdd etc stats
+    }
+    $first_child=0;
     # keep looping
   } elsif ($pid==0) {
     #child;
@@ -520,8 +566,10 @@ while () {
   # if ($ambient_temp > $default_threshold) {
   my $exhaust_temp = exhaust_temp();
   if ($exhaust_temp > $default_exhaust_threshold) {
-    #print "fallback because of high ambient temperature $ambient_temp > $default_threshold\n";
-    print "fallback because of high exhaust temperature $exhaust_temp > $default_exhaust_threshold\n";
+    if (perform_only_once) {
+      #print "fallback because of high ambient temperature $ambient_temp > $default_threshold\n";
+      print "fallback because of high exhaust temperature $exhaust_temp > $default_exhaust_threshold\n";
+    }
     if (!set_fans_default()) {
       # return for next loop without resetting timers and delta change
       # if that fails
@@ -536,7 +584,7 @@ while () {
   }
 
   $print_stats = 0;
-  if (time - $last_print_stats > 60) {
+  if (time - $last_print_stats > $manual_mode_reset_interval) {
     $current_mode="reset"; # just in case the RAC has rebooted, it
                            # will go back into default control, so
                            # make sure we set it appropriately once
