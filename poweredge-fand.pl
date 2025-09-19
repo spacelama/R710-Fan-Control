@@ -404,8 +404,8 @@ sub set_fans_servo {
   # to tiny spikes of 1 fan unit.  FIXME: But should implement long
   # term smoothing of +/- 1 fan unit
   my $demand_has_changed = !defined $lastfan or
-    $demand < $lastfan or
-    $demand > $lastfan + $hysteresis;
+    ($demand < $lastfan) or
+    ($demand > $lastfan + $hysteresis);
   if ($print_stats or
       $demand_has_changed) {
     if ($demand_has_changed) {

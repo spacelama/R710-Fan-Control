@@ -24,80 +24,90 @@ convert_sas() {
     device_product=
     data=
     local exit_code=0
-    while read line ; do
-        case "$read_initial,$read_data,$line" in
-            true,false,*DATA\ SECTION*)
-                read_initial=false
-                read_data=true
-                echo "Device Model: $device_vendor $device_product"
-                echo
-                echo "$line"
+    exit_condition=false
+    {
+        read line || exit_condition=true
+        while ! $exit_condition ; do
+            case "$read_initial,$read_data,$line" in
+                true,false,*DATA\ SECTION*)
+                    read_initial=false
+                    read_data=true
+                    echo "Device Model: $device_vendor $device_product"
+                    echo
+                    echo "$line"
 
-                read line
-                if [[ "$line" == SMART\ Health\ Status:*OK ]] ; then
-                    exit_code=0
-                else
-                    exit_code=8
-                fi
-                echo "$line"
+                    read line
+                    if [[ "$line" == SMART\ Health\ Status: ]] ; then
+                        if [[ "$line" == *OK ]] ; then
+                            exit_code=0
+                        else
+                            exit_code=8
+                        fi
+                        echo "$line"
+                        echo
+                        read line
+                    fi
 
-                echo "ID# ATTRIBUTE_NAME          FLAG     VALUE WORST THRESH TYPE      UPDATED  WHEN_FAILED RAW_VALUE"
-                ;;
-            true,false,Vendor:*)
-                device_vendor="$( echo "$line" | sed 's/Vendor: *//' )"
-                echo "$line"
-                ;;
-            true,false,Product:*)
-                device_product="$( echo "$line" | sed 's/Product: *//' )"
-                echo "$line"
-                ;;
-            true*)
-                echo "$line"
-                ;;
-            false,true,Current\ Drive\ Temperature:*)
-                temp="$( echo "$line" | sed 's/.*Temperature: *// ; s/ C$//' )"
-                ;;
-            false,true,Drive\ Trip\ Temperature:*)
-                temp_threshold="$( echo "$line" | sed 's/.*Drive Trip Temperature: *// ; s/ C$//' )"
-                hundred_minus_temp="$( printf "%03.f" "$( echo "100 - $temp" | bc -l )" )"
-                echo "194 Temperature_Celsius null $hundred_minus_temp $hundred_minus_temp 000 Old_age Always - $temp (Min/Max 0/$temp_threshold)"
-                ;;
-            false,true,Accumulated\ power\ on\ time,\ hours:minutes:*)
-                hours="$( echo "$line" | sed 's/.*hours:minutes // ; s/:.*//' )"
-#                minutes="$( echo "$line" | sed 's/.*hours:minutes // ; s/.*://' )"
-#                hours="$( echo "scale=2 ; $hours + $minutes/60" | bc -l )"
-                echo "9 Power_On_Hours null 100 100 000 Old_age Always - $hours"
-                ;;
-            false,true,Specified\ cycle\ count\ over\ device\ lifetime:*)
-                start_stop_cycles_threshold="$( echo "$line" | sed 's/.*Specified cycle count over device lifetime: *//' )"
-                ;;
-            false,true,Accumulated\ start-stop\ cycles:*)
-                start_stop_cycles="$( echo "$line" | sed 's/.*Accumulated start-stop cycles: *//' )"
-                hundred_minus_cycles="$( printf "%03.f" "$( echo "100 - 100*$start_stop_cycles/$start_stop_cycles_threshold" | bc -l )" )"
-                echo "12 Power_Cycle_Count null $hundred_minus_cycles $hundred_minus_cycles 000 Pre-fail Always - $start_stop_cycles"
-                ;;
-            false,true,Specified\ load-unload\ count\ over\ device\ lifetime:*)
-                load_unload_cycles_threshold="$( echo "$line" | sed 's/.*Specified load-unload count over device lifetime: *//' )"
-                ;;
-            false,true,Accumulated\ load-unload\ cycles:*)
-                load_unload_cycles="$( echo "$line" | sed 's/.*Accumulated load-unload cycles: *//' )"
-                hundred_minus_cycles="$( printf "%03.f" "$( echo "100 - 100*$load_unload_cycles/$load_unload_cycles_threshold" | bc -l )" )"
-                echo "193 Load_Cycle_Count null $hundred_minus_cycles $hundred_minus_cycles 000 Pre-fail Always - $load_unload_cycles"
-                ;;
-            false,true,Elements\ in\ grown\ defect\ list:*)
-                defects="$( echo "$line" | sed 's/.*Elements in grown defect list: //' )"
-                echo "5 Reallocated_Sector_Ct null 100 100 001 Pre-fail Always - $defects"
-                ;;
-            false,true,Non-medium\ error\ count:*)
-                errors="$( echo "$line" | sed 's/.*Non-medium error count: //' )"
-                echo "1 Raw_Read_Error_Rate null 100 100 001 Pre-fail Always - $errors"
-                ;;
-            *)
-                data="$data
+                    echo "ID# ATTRIBUTE_NAME          FLAG     VALUE WORST THRESH TYPE      UPDATED  WHEN_FAILED RAW_VALUE"
+                    continue  # reparse the new line
+                    ;;
+                true,false,Vendor:*)
+                    device_vendor="$( echo "$line" | sed 's/Vendor: *//' )"
+                    echo "$line"
+                    ;;
+                true,false,Product:*)
+                    device_product="$( echo "$line" | sed 's/Product: *//' )"
+                    echo "$line"
+                    ;;
+                true*)
+                    echo "$line"
+                    ;;
+                false,true,Current\ Drive\ Temperature:*)
+                    temp="$( echo "$line" | sed 's/.*Temperature: *// ; s/ C$//' )"
+                    ;;
+                false,true,Drive\ Trip\ Temperature:*)
+                    temp_threshold="$( echo "$line" | sed 's/.*Drive Trip Temperature: *// ; s/ C$//' )"
+                    hundred_minus_temp="$( printf "%03.f" "$( echo "100 - $temp" | bc -l )" )"
+                    echo "194 Temperature_Celsius null $hundred_minus_temp $hundred_minus_temp 000 Old_age Always - $temp (Min/Max 0/$temp_threshold)"
+                    ;;
+                false,true,Accumulated\ power\ on\ time,\ hours:minutes:*)
+                    hours="$( echo "$line" | sed 's/.*hours:minutes // ; s/:.*//' )"
+                    #                minutes="$( echo "$line" | sed 's/.*hours:minutes // ; s/.*://' )"
+                    #                hours="$( echo "scale=2 ; $hours + $minutes/60" | bc -l )"
+                    echo "9 Power_On_Hours null 100 100 000 Old_age Always - $hours"
+                    ;;
+                false,true,Specified\ cycle\ count\ over\ device\ lifetime:*)
+                    start_stop_cycles_threshold="$( echo "$line" | sed 's/.*Specified cycle count over device lifetime: *//' )"
+                    ;;
+                false,true,Accumulated\ start-stop\ cycles:*)
+                    start_stop_cycles="$( echo "$line" | sed 's/.*Accumulated start-stop cycles: *//' )"
+                    hundred_minus_cycles="$( printf "%03.f" "$( echo "100 - 100*$start_stop_cycles/$start_stop_cycles_threshold" | bc -l )" )"
+                    echo "12 Power_Cycle_Count null $hundred_minus_cycles $hundred_minus_cycles 000 Pre-fail Always - $start_stop_cycles"
+                    ;;
+                false,true,Specified\ load-unload\ count\ over\ device\ lifetime:*)
+                    load_unload_cycles_threshold="$( echo "$line" | sed 's/.*Specified load-unload count over device lifetime: *//' )"
+                    ;;
+                false,true,Accumulated\ load-unload\ cycles:*)
+                    load_unload_cycles="$( echo "$line" | sed 's/.*Accumulated load-unload cycles: *//' )"
+                    hundred_minus_cycles="$( printf "%03.f" "$( echo "100 - 100*$load_unload_cycles/$load_unload_cycles_threshold" | bc -l )" )"
+                    echo "193 Load_Cycle_Count null $hundred_minus_cycles $hundred_minus_cycles 000 Pre-fail Always - $load_unload_cycles"
+                    ;;
+                false,true,Elements\ in\ grown\ defect\ list:*)
+                    defects="$( echo "$line" | sed 's/.*Elements in grown defect list: //' )"
+                    echo "5 Reallocated_Sector_Ct null 100 100 001 Pre-fail Always - $defects"
+                    ;;
+                false,true,Non-medium\ error\ count:*)
+                    errors="$( echo "$line" | sed 's/.*Non-medium error count: //' )"
+                    echo "1 Raw_Read_Error_Rate null 100 100 001 Pre-fail Always - $errors"
+                    ;;
+                *)
+                    data="$data
 $line"
-                ;;
-        esac
-    done <<< "$1"
+                    ;;
+            esac
+            read line || exit_condition=true
+        done
+    } <<< "$1"
     if [ -n "$data" ] ; then
         echo
         echo "=== SAS DATA ==="
