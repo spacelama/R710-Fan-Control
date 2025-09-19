@@ -22,6 +22,7 @@ convert_sas() {
     read_data=false
     device_model=
     device_product=
+    data=
     local exit_code=0
     while read line ; do
         case "$read_initial,$read_data,$line" in
@@ -29,25 +30,29 @@ convert_sas() {
                 read_initial=false
                 read_data=true
                 echo "Device Model: $device_vendor $device_product"
+                echo
                 echo "$line"
-                echo "ID# ATTRIBUTE_NAME          FLAG     VALUE WORST THRESH TYPE      UPDATED  WHEN_FAILED RAW_VALUE"
-                ;;
-            true,false,Vendor:*)
-                device_vendor="$( echo "$line" | sed 's/Vendor: *//' )"
-                ;;
-            true,false,Product:*)
-                device_product="$( echo "$line" | sed 's/Product: *//' )"
-                ;;
-            true*)
-                echo "$line"
-                ;;
-            false,true,SMART\ Health\ Status:*)
-                if [[ "$line" == *OK ]] ; then
+
+                read line
+                if [[ "$line" == SMART\ Health\ Status:*OK ]] ; then
                     exit_code=0
                 else
                     exit_code=8
                 fi
-#                echo "$line"
+                echo "$line"
+
+                echo "ID# ATTRIBUTE_NAME          FLAG     VALUE WORST THRESH TYPE      UPDATED  WHEN_FAILED RAW_VALUE"
+                ;;
+            true,false,Vendor:*)
+                device_vendor="$( echo "$line" | sed 's/Vendor: *//' )"
+                echo "$line"
+                ;;
+            true,false,Product:*)
+                device_product="$( echo "$line" | sed 's/Product: *//' )"
+                echo "$line"
+                ;;
+            true*)
+                echo "$line"
                 ;;
             false,true,Current\ Drive\ Temperature:*)
                 temp="$( echo "$line" | sed 's/.*Temperature: *// ; s/ C$//' )"
@@ -87,8 +92,17 @@ convert_sas() {
                 errors="$( echo "$line" | sed 's/.*Non-medium error count: //' )"
                 echo "1 Raw_Read_Error_Rate null 100 100 001 Pre-fail Always - $errors"
                 ;;
+            *)
+                data="$data
+$line"
+                ;;
         esac
     done <<< "$1"
+    if [ -n "$data" ] ; then
+        echo
+        echo "=== SAS DATA ==="
+        echo "$data"
+    fi
 
     return $exit_code
 }
