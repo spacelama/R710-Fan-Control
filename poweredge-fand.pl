@@ -8,7 +8,6 @@
 # background information:
 # https://www.dell.com/community/PowerEdge-Hardware-General/T130-Fan-Speed-Algorithm/td-p/5052692
 # https://serverfault.com/questions/715387/how-do-i-stop-dell-r730xd-fans-from-going-full-speed-when-broadcom-qlogic-netxtr/733064#733064
-# could monitor H710 temperature with sudo env /opt/MegaRAID/MegaCli/MegaCli64 -AdpAllInfo -aALL | grep -i temperature
 
 use strict;
 use warnings;
@@ -251,7 +250,7 @@ sub raid_controller_temp {
     # getting stuck in the D state, holding STDERR open despite a kill
     # -9, so instead just send it to a tempfile, and read from that
     # tempfile
-    system("timeout -k 1 20 /opt/MegaRAID/MegaCli/MegaCli64 -AdpAllInfo -aALL | grep -i ^ROC.temperature | awk '{print \$4}' > $tempfilename");
+    system("timeout -k 1 20 /opt/MegaRAID/MegaCli/MegaCli64 -AdpAllInfo -aALL -NoLog | grep -i ^ROC.temperature | awk '{print \$4}' > $tempfilename");
 
     my $val = `cat < $tempfilename`; chomp $val;
     if ($val ne "") {
@@ -261,6 +260,27 @@ sub raid_controller_temp {
   }
 
   return $raid_controller_cache_temp;
+}
+
+my $raid_controller_battery_temp;
+my $raid_controller_battery_time;
+sub raid_controller_battery_temp {
+  if (!defined $raid_controller_battery_time or
+      $raid_controller_battery_time > $raid_controller_poll_interval) {
+    # could just be a simple pipe, but protect against something
+    # getting stuck in the D state, holding STDERR open despite a kill
+    # -9, so instead just send it to a tempfile, and read from that
+    # tempfile
+    system("timeout -k 1 20 /opt/MegaRAID/MegaCli/MegaCli64 -AdpBbuCmd -GetBbuStatus -aALL -NoLog | grep -i ^ROC.temperature | awk '{print \$4}' > $tempfilename");
+
+    my $val = `cat < $tempfilename`; chomp $val;
+    if ($val ne "") {
+      $raid_controller_battery_temp = $val;
+      $raid_controller_battery_time = time;
+    }
+  }
+
+  return $raid_controller_battery_temp;
 }
 
 my $ambient_cache_temp = 20;
