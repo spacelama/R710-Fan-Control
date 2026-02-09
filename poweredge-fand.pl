@@ -55,9 +55,12 @@ sub custom_temperature_calculation;
 # cache of the slowly changing hdd temperatures to allow them to be
 # refreshed
 my $hdd_poll_interval=1200;
+# Megasascli doesn't appear to wake drives or keep them spinning, and
+# it's much quicker, so can afford to poll more often
+my $megasascli_poll_interval=300;
 # Raid controller is less expensive to poll, but also should't change
-# overly rapidly
-my $raid_controller_poll_interval=30;
+# overly rapidly (but it doesn't have a huge heatsink, so don't be too slow)
+my $raid_controller_poll_interval=60;
 # Every 60 seconds, invalidate the cache of the slowly changing
 # ambient temperatures to allow them to be refreshed
 my $ambient_poll_interval=60;
@@ -218,18 +221,59 @@ sub max {
 
 my %hdd_cache_temp;
 my %hdd_cache_time;
-# FIXME: should we use /usr/local/bin/megaclisas-status for all temps?  How does it handle drives in sleep mode?
 sub hddtemp {
   my ($device)=(@_);
 
-  # FIXME: if user supplies a parameter of the form of [32:13], interpret it as "Slot ID" form output by megaclisas-status
+  # if /usr/local/bin/megaclisas-status exists, then parse it for
+  # hddtemps, and if user supplies a parameter of the form of [32:13],
+  # interpret it as "Slot ID".  Otherwise we have to parse hddtemp,
+  # and for that, we don't know how many lockfiles we're going to have
+  # to arrange, so we can't make use of obtain_cachable()
+  if (-x "/usr/local/bin/megaclisas-status") {
+    my @drive_temps = obtain_cachable
+      ("megaclisas_temp",
+       $megasascli_poll_interval,
+       "timeout -k 1 20 /usr/local/bin/megaclisas-status");
+
+    if (!($device =~ /^\[\d+:\d+\]$/)) {
+      $device = Cwd::realpath ($device);
+    }
+    foreach my $megasas_line (@drive_temps) {
+      my (@fields) =
+        split(" ", $megasas_line);
+
+      if (@fields and
+          $fields[0] =~ /^c.....$/) {
+        my $temp = $fields[-7];
+        $temp =~ s/C$//; # get rid of the "C" celcius unit
+        if ($device =~ /^\[\d+:\d+\]$/) {
+          # the 5th last non-space field (including "|"), regardless
+          # of how many spaces are in the drive model, is always the
+          # slot id.
+          my $scan_slot_id = $fields[-5];
+          if ($scan_slot_id eq $device) {
+            return $temp;
+          }
+        } else {
+          my $scan_device = $fields[-1];
+          if ($scan_device eq $device) {
+            return $temp;
+          }
+        }
+      }
+    }
+    # if we haven't returned by now, then the device didn't appear in
+    # megaclisas output.  Fall back to old fashioned hddtemp
+  }
+
   return if ! -e $device;
 
   if (!defined $hdd_cache_time{$device} or
       $hdd_cache_time{$device} > $hdd_poll_interval) {
     # could just be a simple pipe, but hddtemp has a strong posibility
     # to be stuck in a D state, and hold STDERR open despite a kill
-    # -9, so instead just send it to a tempfile, and read from that tempfile
+    # -9, so instead just send it to a tempfile, and read from that
+    # tempfile
 
     # Some HDDs will be spun down, so they return "not available".
     # Treat them as if they weren't there.

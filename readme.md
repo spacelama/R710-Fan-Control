@@ -34,6 +34,11 @@ I wrote it the night before Australia's hottest December day on record
 coping so far now that it has reached that predicted peak (I don't
 believe it's only 26 in my un-air conditioned study).
 
+If you install megaclisas-status (included), then it is used to obtain
+a very expedient list of device temperatures.  If it still doesn't
+match the devices you've configured, then it falls back hddtemp, which
+is slower.
+
 It also includes my own hddtemp implementation that intercepts
 smartctl so it doesn't spin up spundown disks that aren' always
 detected by `smartctl --nocheck=standby,0`, and tries to parse SAS
@@ -55,7 +60,7 @@ sudo apt remove hddtemp
 
 sudo cp -p poweredge-fand.pl /usr/local/bin && sudo chmod 755 /usr/local/bin/poweredge-fand.pl
 sudo cp -p poweredge-fand.conf /etc
-sudo cp -p hddtemp smart-intercept-spindown smartctlnvme /usr/local/bin/ && sudo chmod 755 /usr/local/bin/{hddtemp,smart-intercept-spindown,smartctlnvme}
+sudo cp -p hddtemp megaclisas-status smart-intercept-spindown smartctlnvme /usr/local/bin/ && sudo chmod 755 /usr/local/bin/{hddtemp,megaclisas-status,smart-intercept-spindown,smartctlnvme}
 sudo cp -p poweredge-fand.service /etc/systemd/system/poweredge-fand.service
 sudo systemctl daemon-reload
 sudo systemctl --now enable poweredge-fand.service
