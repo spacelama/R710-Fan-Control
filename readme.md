@@ -101,9 +101,9 @@ fans fallback to their default Dell iDrac behaviour).
 You might want to modify setpoints and thresholds.  $demand isn't
 actually a percentage. That code is a mess, $static_speed_high is more
 or less arbitrary - the initial ramps are chosen to sort of scale from
-an input of 0-255 and map to 0x02 to 0x12 ($static_speed_low to
+an input of 0-(arbitrary)255 and map to 0x02 to 0x12 ($static_speed_low to
 $static_speed_high), which is bloody loud and fast on my machines, but
-are allowed to continue linearly even further all the way to 255 if
+are allowed to continue linearly even further all the way to 100 if
 necessary if the temperature ramps up to 6 million degrees.
 
 I found it simple to test by starting up a whole bunch of busy loops

@@ -17,6 +17,8 @@ use JSON;
 use Data::Dumper;
 use POSIX ":sys_wait_h"; # for nonblocking read
 use Time::HiRes qw (sleep);
+use Cwd;
+use Fcntl qw(:flock);
 
 my $static_speed_low;
 my $static_speed_high;   # This is the speed value at 100% demand
@@ -79,7 +81,11 @@ my $lastfan;
 my $quiet=0;          # whether to print stats at all
 my $print_stats = 1;  # whether to print stats this run
 
-my $tempfilename;
+my $tempfilename;     # just a generic tmpfile owned independently by each fork
+
+my %tempfilename;     # the hash of tmpfiles we use to cache all results
+my %tempfh;           # and handles
+
 my @daemons;
 my %children;
 my $started;
@@ -143,7 +149,7 @@ sub sleep_and_check_for_exit {
 # Only test true in one of the daemons, for the first fan (or the
 # daemon that's controlling all fans simultaneously)
 sub perform_only_once {
-  return ($fans == 0 or $fans == 0xff);
+  return (!defined $fans or $fans == 0 or $fans == 0xff);
 }
 
 # Only print out the stats in one of the daemons, for the first
@@ -289,87 +295,115 @@ sub hddtemp {
   return $hdd_cache_temp{$device};
 }
 
-my $raid_controller_cache_temp;
-my $raid_controller_cache_time;
-sub raid_controller_temp {
-  if (!defined $raid_controller_cache_time or
-      $raid_controller_cache_time > $raid_controller_poll_interval) {
-    # could just be a simple pipe, but protect against something
-    # getting stuck in the D state, holding STDERR open despite a kill
-    # -9, so instead just send it to a tempfile, and read from that
-    # tempfile
-    system("timeout -k 1 20 /opt/MegaRAID/MegaCli/MegaCli64 -AdpAllInfo -aALL -NoLog | grep -i ^ROC.temperature | awk '{print \$4}' > $tempfilename");
+# When we otherwise could just use a simple pipe, but we want to
+# protect against something getting stuck in the D state, holding
+# STDERR open despite a kill -9, we can instead just send it to a
+# tempfile, and read from that tempfile.  We also then gain a
+# mechanism to cache the output between all forks dealing with the
+# different fans.
+sub obtain_cachable {
+  my ($cache_bucket, $cache_interval, $cmd) = (@_);
 
-    my $val = `cat < $tempfilename`; chomp $val;
-    if ($val ne "") {
-      $raid_controller_cache_temp = $val;
-      $raid_controller_cache_time = time;
+  my $cache_file=$tempfilename{$cache_bucket};
+  my $cache_fh  =$tempfh      {$cache_bucket};
+
+  # always go for an exclusive (write) lock, *then* compare if mtime
+  # of that file has passed the cache_interval yet.  If not, we
+  # quickly read the file and unlock.  If we had to block because
+  # someone else was writing it, then we'll eventually be unblocked,
+  # we'll determine the age of the file and find that it's fresh (or
+  # in need of invalidation)
+
+  if (flock($cache_fh, LOCK_EX)) {
+    my ($mtime) = (stat($cache_file))[9];
+    die "our state file has been deleted: $!" if (!defined $mtime);
+
+    # if the file had previously been written but an error lead to
+    # there being no content, or only just opened, then we force a new
+    # generation of the output.  Otherwise, we generate the output
+    # only if the cache_interval has expired
+    if (!(-s $cache_file) or
+        (time() - $mtime >= $cache_interval)) {
+      system("$cmd > $cache_file");
+      # system("echo $cache_bucket 1>&2 ; grep -H . $cache_file 1>&2");
     }
-  }
+    seek $cache_fh, 0, 0 or die "Cannot seek file '$cache_file' - $!";
 
-  return $raid_controller_cache_temp;
+    my (@res, $res);
+    if (wantarray) {
+      @res = <$cache_fh>;
+    } else {
+      $res = <$cache_fh>;
+      if (defined $res) {
+        chomp $res;
+      } else {
+        $res="";
+      }
+    }
+
+    if (flock($cache_fh, LOCK_UN)) {
+      if (wantarray) {
+        return @res;
+      } else {
+        return $res;
+      }
+    } else {
+      die "Failed to unlock $cache_file: $!";
+    }
+  } else {
+    die "Failed to get exclusive lock on $cache_file: $!";
+  }
 }
 
-my $raid_controller_battery_temp;
-my $raid_controller_battery_time;
+sub raid_controller_temp {
+  my $val=obtain_cachable
+    ("raid_controller_temp",
+     $raid_controller_poll_interval,
+     "timeout -k 1 20 /opt/MegaRAID/MegaCli/MegaCli64 -AdpAllInfo -aALL -NoLog | grep -i ^ROC.temperature | awk '{print \$4}'");
+  return $val;
+}
+
 sub raid_controller_battery_temp {
-  if (!defined $raid_controller_battery_time or
-      $raid_controller_battery_time > $raid_controller_poll_interval) {
-    # could just be a simple pipe, but protect against something
-    # getting stuck in the D state, holding STDERR open despite a kill
-    # -9, so instead just send it to a tempfile, and read from that
-    # tempfile
-    system("timeout -k 1 20 /opt/MegaRAID/MegaCli/MegaCli64 -AdpBbuCmd -GetBbuStatus -aALL -NoLog | grep -i ^ROC.temperature | awk '{print \$4}' > $tempfilename");
-
-    my $val = `cat < $tempfilename`; chomp $val;
-    if ($val ne "") {
-      $raid_controller_battery_temp = $val;
-      $raid_controller_battery_time = time;
-    }
-  }
-
-  return $raid_controller_battery_temp;
+  my $val=obtain_cachable
+    ("raid_controller_battery_temp",
+     $raid_controller_poll_interval,
+     "timeout -k 1 20 /opt/MegaRAID/MegaCli/MegaCli64 -AdpBbuCmd -GetBbuStatus -aALL -NoLog | grep -i ^temperature | awk '{print \$2}'");
+  return $val;
 }
 
 my $ambient_cache_temp = 20;
-my $ambient_cache_time;
 sub ambient_temp {
-  if (!defined $ambient_cache_time or
-      $ambient_cache_time > $ambient_poll_interval) {
-    system("timeout -k 1 20 ipmitool sdr type temperature | grep '$ipmi_inlet_sensorname' | grep [0-9] > $tempfilename");
+  my @ambient_ipmitemps = obtain_cachable
+    ("ambient_temp",
+     $ambient_poll_interval,
+    "timeout -k 1 20 ipmitool sdr type temperature | grep '$ipmi_inlet_sensorname' | grep [0-9]");
 
-    my @ambient_ipmitemps = `cat < $tempfilename`;
-    # apply from List::MoreUtils
-    @ambient_ipmitemps = apply { s/.*\| ([^ ]*) degrees C.*/$1/ } @ambient_ipmitemps;
+  # apply from List::MoreUtils
+  @ambient_ipmitemps = apply { s/.*\| ([^ ]*) degrees C.*/$1/ } @ambient_ipmitemps;
 
-    if (@ambient_ipmitemps) {
-      # ipmitool often fails - just keep using the previous result til
-      # it succeeds
-      $ambient_cache_temp = average(@ambient_ipmitemps);
-      $ambient_cache_time = time;
-    }
+  if (@ambient_ipmitemps) {
+    # ipmitool often fails - just keep using the previous result til
+    # it succeeds
+    $ambient_cache_temp = average(@ambient_ipmitemps);
   }
 
   return $ambient_cache_temp;
 }
 
 my $exhaust_cache_temp = 30;
-my $exhaust_cache_time;
 sub exhaust_temp {
-  if (!defined $exhaust_cache_time or
-      $exhaust_cache_time > $exhaust_poll_interval) {
-    system("timeout -k 1 20 ipmitool sdr type temperature | grep '$ipmi_exhaust_sensorname' | grep [0-9] > $tempfilename");
+  my @exhaust_ipmitemps = obtain_cachable
+    ("exhaust_temp",
+     $exhaust_poll_interval,
+     "timeout -k 1 20 ipmitool sdr type temperature | grep '$ipmi_exhaust_sensorname' | grep [0-9]");
 
-    my @exhaust_ipmitemps = `cat < $tempfilename`;
-    # apply from List::MoreUtils
-    @exhaust_ipmitemps = apply { s/.*\| ([^ ]*) degrees C.*/$1/ } @exhaust_ipmitemps;
+  # apply from List::MoreUtils
+  @exhaust_ipmitemps = apply { s/.*\| ([^ ]*) degrees C.*/$1/ } @exhaust_ipmitemps;
 
-    if (@exhaust_ipmitemps) {
-      # ipmitool often fails - just keep using the previous result til
-      # it succeeds
-      $exhaust_cache_temp = average(@exhaust_ipmitemps);
-      $exhaust_cache_time = time;
-    }
+  if (@exhaust_ipmitemps) {
+    # ipmitool often fails - just keep using the previous result til
+    # it succeeds
+    $exhaust_cache_temp = average(@exhaust_ipmitemps);
   }
 
   return $exhaust_cache_temp;
@@ -473,10 +507,12 @@ sub set_fans_servo {
   # ramp down the fans quickly upon lack of demand, don't ramp them
   # up/down to tiny spikes of 1 fan unit.
   if ($in_deadband) {
-    $in_deadband = (($demand >= $lastfan - $hysteresis) and
+    $in_deadband = ((defined $lastfan) and
+                    ($demand >= $lastfan - $hysteresis) and
                     ($demand <= $lastfan + $hysteresis));
   } else {
-    $in_deadband = ($demand == $lastfan);
+    $in_deadband = ((defined $lastfan) and
+                    ($demand == $lastfan));
   }
   my $demand_has_changed = ((! defined $lastfan) ||
                             (! $in_deadband)     ||
@@ -516,7 +552,7 @@ sub child_handler {
 
 sub signal_handler {
   $signame = shift;
-  print "poweredge-fand(", (we_are_parent() ? "" : "$parent_pid -> " ), "$$): Recieved signal $signame\n";
+  print STDERR "poweredge-fand(", (we_are_parent() ? "" : "$parent_pid -> " ), "$$): Recieved signal $signame\n";
   $SIG{$signame} = "DEFAULT";
   exit;
 };
@@ -529,7 +565,7 @@ END {
       # we're the parent, and need to kill all our children and reset
       # fans back to default
       my (@children) = keys %children;
-      print "Killing children: @children\n";
+      print STDERR "Killing children: @children\n";
       kill "TERM", @children;
       my $children_left;
       for my $checks (1..100) {
@@ -539,25 +575,28 @@ END {
         }
         $children_left = kill 0, @children;
         if ($children_left) {
-          print "Still waiting for $children_left children to die: @children\n"
+          print STDERR "Of @children, we're still waiting for $children_left children to die\n"
         } else {
           last;
         }
-        sleep 0.03
+        sleep 0.03;   # We try 100 times, or for at least 3 seconds
       }
       if ($children_left) {
-        print "Not all children died. $children_left children were left, which may contain: @children\n"
+        print STDERR "Some of @children may have not died. $children_left children were left\n"
       }
-      print "Resetting fans back to default\n";
+      print STDERR "Resetting fans back to default\n";
       my $saved_signame=$signame;
       $signame=undef;
       set_fans_default;
       $signame=$saved_signame;
     }
+    foreach my $tmpfile (keys %tempfilename) {
+      unlink $tmpfile;
+    }
   } else {
-    # we're a child daemon, and need to unlink our temporary file
+    # we're a child daemon, and need to unlink our fork's temporary file
     unlink $tempfilename if defined $tempfilename;
-    print "Child fan $fans dying: $$\n";
+    print STDERR "Child fan $fans dying: $$\n";
   }
   if ($signame) {
     $SIG{$signame} = "DEFAULT";
@@ -587,17 +626,16 @@ include $conf_file;
 $started=1;
 $SIG{TERM} = $SIG{HUP} = $SIG{INT} = \&signal_handler;
 
-my $first_child=1;
+foreach my $cache_bucket ("megaclisas_temp", "raid_controller_temp", "raid_controller_battery_temp", "ambient_temp", "exhaust_temp") {
+  ($tempfh{$cache_bucket}, $tempfilename{$cache_bucket}) =
+    tempfile("poweredge-fand.$cache_bucket.XXXXX", TMPDIR => 1);
+}
+
 foreach my $loop_fan (@daemons) {
   my $pid;
   if ($pid=fork) {
     #parent;
     $children{$pid}=1;
-    if ($first_child) {
-      sleep 20;  # give time for the first daemon to gather all
-                 # ambient, hdd etc stats
-    }
-    $first_child=0;
     # keep looping
   } elsif ($pid==0) {
     #child;
@@ -616,12 +654,12 @@ if (we_are_parent()) {
   wait;   # wait for the first child to die, then exit, killing all
           # the rest (to signal to systemd that we died)
 
-  print "One of our children died with $?, so we're exiting\n";
+  print "One of our children died with $?, so we're exiting as a group\n";
   exit $?;
 }
 
 my $tempfh;
-($tempfh, $tempfilename) = tempfile("poweredge-fand.temp.XXXXX", TMPDIR => 1);
+($tempfh, $tempfilename) = tempfile("poweredge-fand.child-$fans.XXXXX", TMPDIR => 1);
 
 my $last_print_stats=time;
 while () {
