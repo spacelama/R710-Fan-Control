@@ -36,6 +36,10 @@ my $demand1;             # Prescaled (not taking into effect static_speed_low/hi
 my $demand2;             # Prescaled (not taking into effect static_speed_low/high) demand at temp2
 my $demand3;             # Prescaled (not taking into effect static_speed_low/high) demand at temp3
 
+my $in_deadband=0;       # if already in hysteresis deadband, then we
+                         # adopt the hysteresis value.  Otherwise we
+                         # servo down to the demandpoint, and then
+                         # when we reach that, set $in_deadband
 my $hysteresis;          # Don't ramp up velocity unless demand
                          # difference is greater than this.  Ramp
                          # down ASAP however, to bias quietness, and
@@ -414,33 +418,37 @@ sub set_fans_servo {
   }
 
   my $demand_out = int($static_speed_low + $demand/100*($static_speed_high-$static_speed_low));
-  if ($demand_out>255) {
-    $demand_out=255;
+  if ($demand_out>100) {
+    $demand_out=100; # top value accepted by ipmitool raw 0x30 ... is
+                     # 0x64.  Which is strangely enough, 100.
   }
   my $stats_to_print=sprintf "weighted_temp($fans) = %6.2f ; demand($fans)=%6.2f -> %3i", $weighted_temp, $demand, $demand_out;
-  $demand = $demand_out;
+  $demand = sprintf("%i", $demand_out);
+  # print "demand = $demand\n";
 
-  # ramp down the fans quickly upon lack of demand, don't ramp them up
-  # to tiny spikes of 1 fan unit.  FIXME: But should implement long
-  # term smoothing of +/- 1 fan unit
-  my $demand_has_changed = !defined $lastfan or
-    ($demand < $lastfan) or
-    ($demand > $lastfan + $hysteresis);
+  # ramp down the fans quickly upon lack of demand, don't ramp them
+  # up/down to tiny spikes of 1 fan unit.
+  if ($in_deadband) {
+    $in_deadband = (($demand >= $lastfan - $hysteresis) and
+                    ($demand <= $lastfan + $hysteresis));
+  } else {
+    $in_deadband = ($demand == $lastfan);
+  }
+  my $demand_has_changed = ((! defined $lastfan) ||
+                            (! $in_deadband)     ||
+                            ($demand == 0) || ($demand == 100));
   if ($print_stats or
       $demand_has_changed) {
-    if ($demand_has_changed) {
-      $lastfan = $demand;
-    }
-    $demand = sprintf("0x%02x", $demand);
-    # print "demand = $demand\n";
-
     # allowed to print out of minute-printing cycle if the demand
     # actually changes
     print "$stats_to_print --> ipmitool raw 0x30 0x30 0x02 $fans $demand\n";
     # ipmitool routinely fails; that's OK, if this fails, want to
     # return telling caller not to think we've made a change
-    if (system("ipmitool raw 0x30 0x30 0x02 $fans $demand") != 0) {
-      return 0;
+    if ($demand_has_changed) {
+      if (system("ipmitool raw 0x30 0x30 0x02 $fans $demand") != 0) {
+        return 0;
+      }
+      $lastfan = $demand;
     }
   }
   return 1;
