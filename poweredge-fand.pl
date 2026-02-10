@@ -70,12 +70,11 @@ my $exhaust_poll_interval=60;
 # And put fan back under our control once per minute if someone
 # slipped it back into idrac mode, if all conditions are correct
 my $manual_mode_reset_interval=60;
-my $cpu_poll_interval=5;
+my $cpu_poll_interval=3;
 
 my $sensors_ref;
 my $temperature_calculation_sub;
 
-my $current_mode;
 my $lastfan;
 
 my $quiet=0;          # whether to print stats at all
@@ -308,6 +307,33 @@ sub hddtemp {
   return $hdd_cache_temp{$device};
 }
 
+sub lock {
+  my ($fh, $name)=(@_);
+  # We have to use fcntl() rather than the easier to use flock,
+  # because the filedescriptors come from our parent, and all users of
+  # the same file descriptor share the same flock locks.  If this
+  # didn't work, you'd simply revert back to flock, but get each child
+  # to reopen the tempfile as a new filehandle only they have
+
+  # Define the flock structure (l_type, l_whence, l_start, l_len, l_pid)
+  # F_WRLCK: Exclusive Write Lock
+  # SEEK_SET: Start from beginning
+  # 0, 0: Offset 0, Length 0 means entire file
+  my $lock_struct = pack('s s l l i', F_WRLCK, SEEK_SET, 0, 0, 0);
+
+  # Apply the lock (blocks until available)
+  fcntl($fh, F_SETLKW, $lock_struct) or die "Cannot lock file '$name': $!";
+}
+
+sub unlock {
+  my ($fh, $name)=(@_);
+
+  # reverse the lock
+  my $unlock_struct = pack('s s l l i', F_UNLCK, SEEK_SET, 0, 0, 0);
+
+  fcntl($fh, F_SETLKW, $unlock_struct) or die "Cannot unlock file '$name': $!";
+}
+
 # When we otherwise could just use a simple pipe, but we want to
 # protect against something getting stuck in the D state, holding
 # STDERR open despite a kill -9, we can instead just send it to a
@@ -327,20 +353,7 @@ sub obtain_cachable {
   # we'll determine the age of the file and find that it's fresh (or
   # in need of invalidation)
 
-  # We have to use fcntl() rather than the easier to use flock,
-  # because the filedescriptors come from our parent, and all users of
-  # the same file descriptor share the same flock locks.  If this
-  # didn't work, you'd simply revert back to flock, but get each child
-  # to reopen the tempfile as a new filehandle only they have
-
-  # Define the flock structure (l_type, l_whence, l_start, l_len, l_pid)
-  # F_WRLCK: Exclusive Write Lock
-  # SEEK_SET: Start from beginning
-  # 0, 0: Offset 0, Length 0 means entire file
-  my $lock_struct = pack('s s l l i', F_WRLCK, SEEK_SET, 0, 0, 0);
-
-  # Apply the lock (blocks until available)
-  fcntl($cache_fh, F_SETLKW, $lock_struct) or die "Cannot lock file: $!";
+  lock($cache_fh, $cache_file);
   my ($mtime) = (stat($cache_file))[9];
   die "our state file has been deleted: $!" if (!defined $mtime);
 
@@ -361,10 +374,7 @@ sub obtain_cachable {
   @res = <$cache_fh>;
   chomp @res;
 
-  my $unlock_struct = pack('s s l l i', F_UNLCK, SEEK_SET, 0, 0, 0);
-
-  # now unlock
-  fcntl($cache_fh, F_SETLKW, $unlock_struct) or die "Cannot unlock file: $!";
+  unlock($cache_fh, $cache_file);
   if (wantarray) {
     return @res;
   } else {
@@ -427,30 +437,91 @@ sub exhaust_temp {
   return $exhaust_cache_temp;
 }
 
-sub set_fans_default {
-  if (!defined $current_mode or $current_mode ne "default") {
-    $current_mode="default";
-    $lastfan=undef;
+sub set_fans {
+  my ($new_mode) = (@_);
+
+  # All fan controllers have to agree to take the fan control out of
+  # idrac control (or, more correctly, any of the controllers can put
+  # it back into auto-mode), so the first child that wants to change
+  # the mode has to take a lock, check a statefile, determine whether
+  # we're flipping states, perform the state change itself, updating a
+  # statefile and unlock (the reset is done once per minute anyway if
+  # someone did slip it back into idrac control, but then didn't have
+  # the authority to move it back under manual control)
+  my $fh=$tempfh{idrac_control};
+  my $file=$tempfilename{idrac_control};
+  lock($fh,$file);
+  seek $fh, 0, 0 or die "Cannot seek file '$file' - $!";
+
+  my ($prev_mode) = <$fh>;
+  $prev_mode="" if !defined $prev_mode;
+  chomp $prev_mode;
+  my $print_info=0;
+  my $will_run_mode_switch=0;
+  if ($new_mode eq "default") {
     # this is an abnormal condition, so always warn about it, even in
     # quiet mode
-    if (perform_only_once) {
+    $print_info=1;
+  }
+  if (($new_mode eq "reset") or ($new_mode ne $prev_mode)) {
+    $will_run_mode_switch=1;
+    if ($new_mode ne "reset") {
+      seek $fh, 0, 0 or die "Cannot seek file '$file' - $!";
+      print $fh "$new_mode\n";
+    }
+    # if regularly printing stats, or changing mode, then print the
+    # new mode
+    if ($print_stats or
+        ($new_mode ne "reset")) {
+      $print_info=1;
+    }
+    if ($new_mode eq "reset") {
+      $new_mode=$prev_mode;
+    }
+  }
+
+  if ($print_info) {
+    if ($new_mode eq "servo") {
+      print " --> enable our manual fan control\n";
+    } else {
       print " --> enable dynamic (idrac automatic) fan control\n";
     }
-    # any one of the daemons is allowed to independently call
-    # set_fans_default, so we have to run it for each of them:
-    foreach my $attempt (1..10) {
-      # ipmitool routinely fails, so try up to 10 times since we are
-      # already the failure path, so need to be reliable ourselves
-      if (system("ipmitool raw 0x30 0x30 0x01 0x01") == 0) {
-        return 1;
-      }
-      sleep_and_check_for_exit 1;
-      print "  Retrying dynamic control $attempt\n";
-    }
-    print "Retries of dynamic control all failed\n";
-    return 0;
+  } else {
+    print "\n" if $print_stats;  # in the servo case, the caller
+                                 # before us didn't print a newline so
+                                 # we could append to it, but it turns
+                                 # out we're not printing anything
   }
-  return 1;
+
+  if ($will_run_mode_switch) {
+    if ($new_mode eq "servo") {
+      # ipmitool routinely fails; that's OK, if this fails, want to
+      # return telling caller not to think we've made a change
+      if (system("ipmitool raw 0x30 0x30 0x01 0x00") != 0) {
+        return 0;
+      }
+    } else {
+      foreach my $attempt (1..10) {
+        # ipmitool routinely fails, so try up to 10 times since we are
+        # already the failure path, so need to be reliable ourselves
+        if (system("ipmitool raw 0x30 0x30 0x01 0x01") == 0) {
+          return 1;
+        }
+        sleep_and_check_for_exit 1;
+        print "  Retrying dynamic control $attempt\n";
+      }
+      print "Retries of dynamic control all failed\n";
+      return 0;
+    }
+    return 1;
+  }
+
+  unlock($fh,$file);
+}
+
+sub set_fans_default {
+  $lastfan=undef;
+  return set_fans "default";
 }
 
 sub set_fans_servo {
@@ -465,29 +536,8 @@ sub set_fans_servo {
   my $exhaust_temp = exhaust_temp();
   print "ambient_temp $ambient_temp ; exhaust_temp $exhaust_temp" if print_stats_once;
 
-  # All fan controllers have to agree to take the fan control out of
-  # idrac control (or, more correctly, any of the controllers can put
-  # it back into auto-mode), so we only do the manual invocation from
-  # one of the controllers, in order not to flood the logs and run
-  # ipmitool more often than necessary (the reset is done once per
-  # minute anyway if someone did slip it back into idrac control, but
-  # then didn't have the authority to move it back under manual
-  # control)
-  if (perform_only_once) {
-    if ((!defined $current_mode) or ($current_mode ne "set")) {
-      if ($print_stats or
-          !((defined $current_mode) and ($current_mode eq "reset"))) {
-         print " --> enable our manual fan control\n";
-      }
-    } else {
-      print "\n" if $print_stats;
-    }
-    # ipmitool routinely fails; that's OK, if this fails, want to
-    # return telling caller not to think we've made a change
-    if (system("ipmitool raw 0x30 0x30 0x01 0x00") != 0) {
-      return 0;
-    }
-    $current_mode="set";
+  if (!set_fans "servo") {
+    return 0;
   }
   my $demand = 0; # sort of starts off with a range roughly 0-255,
                   # which we multiply later to be ranged roughly
@@ -575,7 +625,6 @@ sub child_handler {
 sub signal_handler {
   $signame = shift;
   print STDERR "poweredge-fand(" . (we_are_parent() ? "" : "$parent_pid -> " ) . "$$): Recieved signal $signame\n";
-  $SIG{$signame} = "DEFAULT";
   exit;
 };
 END {
@@ -592,6 +641,10 @@ END {
         unlink $cache_file;
       }
 
+      # sleep 0.5;  # systemd has probably already sent signals to all
+                  # the children, who are now busily deleting their
+                  # tmpfiles with signal handler disengaged.  Give
+                  # them a chance to run before killing them
       my (@children) = keys %children;
       print STDERR "Killing children: @children\n";
       kill "TERM", @children;
@@ -652,7 +705,7 @@ include $conf_file;
 $started=1;
 $SIG{TERM} = $SIG{HUP} = $SIG{INT} = \&signal_handler;
 
-foreach my $cache_bucket ("sensors", "megaclisas_temp", "raid_controller_temp", "raid_controller_battery_temp", "ambient_temp", "exhaust_temp") {
+foreach my $cache_bucket ("idrac_control", "sensors", "megaclisas_temp", "raid_controller_temp", "raid_controller_battery_temp", "ambient_temp", "exhaust_temp") {
 
   ($tempfh{$cache_bucket}, $tempfilename{$cache_bucket}) =
     tempfile("poweredge-fand.$cache_bucket.XXXXX", TMPDIR => 1);
@@ -734,10 +787,12 @@ while () {
 
   $print_stats = 0;
   if (time - $last_print_stats > $manual_mode_reset_interval) {
-    $current_mode="reset"; # just in case the RAC has rebooted, it
-                           # will go back into default control, so
-                           # make sure we set it appropriately once
-                           # per minute
+    if (perform_only_once) {
+      set_fans "reset"; # just in case the RAC has rebooted, it
+                        # will go back into default control, so
+                        # make sure we set it appropriately once
+                        # per minute
+    }
     $last_print_stats=time;
     $print_stats = 1 if !$quiet;
   }
