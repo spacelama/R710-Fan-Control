@@ -18,7 +18,7 @@ use Data::Dumper;
 use POSIX ":sys_wait_h"; # for nonblocking read
 use Time::HiRes qw (sleep);
 use Cwd;
-use Fcntl qw(:flock);
+use Fcntl qw(:DEFAULT :flock SEEK_SET);
 
 my $static_speed_low;
 my $static_speed_high;   # This is the speed value at 100% demand
@@ -327,44 +327,55 @@ sub obtain_cachable {
   # we'll determine the age of the file and find that it's fresh (or
   # in need of invalidation)
 
-  if (flock($cache_fh, LOCK_EX)) {
-    my ($mtime) = (stat($cache_file))[9];
-    die "our state file has been deleted: $!" if (!defined $mtime);
+  print STDERR "fan$fans: Trying to obtain lock $cache_file\n";
 
-    # if the file had previously been written but an error lead to
-    # there being no content, or only just opened, then we force a new
-    # generation of the output.  Otherwise, we generate the output
-    # only if the cache_interval has expired
-    if (!(-s $cache_file) or
-        (time() - $mtime >= $cache_interval)) {
-      system("$cmd > $cache_file");
-      # system("echo $cache_bucket 1>&2 ; grep -H . $cache_file 1>&2");
-    }
-    seek $cache_fh, 0, 0 or die "Cannot seek file '$cache_file' - $!";
+  # We have to use fcntl() rather than the easier to use flock,
+  # because the filedescriptors come from our parent, and all users of
+  # the same file descriptor share the same flock locks.  If this
+  # didn't work, you'd simply revert back to flock, but get each child
+  # to reopen the tempfile as a new filehandle only they have
 
-    my (@res, $res);
-    if (wantarray) {
-      @res = <$cache_fh>;
-    } else {
-      $res = <$cache_fh>;
-      if (defined $res) {
-        chomp $res;
-      } else {
-        $res="";
-      }
-    }
+  # Define the flock structure (l_type, l_whence, l_start, l_len, l_pid)
+  # F_WRLCK: Exclusive Write Lock
+  # SEEK_SET: Start from beginning
+  # 0, 0: Offset 0, Length 0 means entire file
+  my $lock_struct = pack('s s l l i', F_WRLCK, SEEK_SET, 0, 0, 0);
 
-    if (flock($cache_fh, LOCK_UN)) {
-      if (wantarray) {
-        return @res;
-      } else {
-        return $res;
-      }
-    } else {
-      die "Failed to unlock $cache_file: $!";
-    }
+  # Apply the lock (blocks until available)
+  fcntl($cache_fh, F_SETLKW, $lock_struct) or die "Cannot lock file: $!";
+  print STDERR "fan$fans: Obtained lock $cache_file\n";
+  system("ls -lA $cache_file 1>&2");
+  my ($mtime) = (stat($cache_file))[9];
+  die "our state file has been deleted: $!" if (!defined $mtime);
+
+  # if the file had previously been written but an error lead to
+  # there being no content, or only just opened, then we force a new
+  # generation of the output.  Otherwise, we generate the output
+  # only if the cache_interval has expired
+  if (!(-s $cache_file) or
+      (time() - $mtime >= $cache_interval)) {
+    # perlfunc: open(): "Duping filehandles"
+    system("$cmd > $cache_file");
+    # system("echo $cache_bucket 1>&2 ; grep -H . $cache_file 1>&2");
+  }
+
+  seek $cache_fh, 0, 0 or die "Cannot seek file '$cache_file' - $!";
+
+  my (@res, $res);
+  @res = <$cache_fh>;
+  chomp @res;
+
+  my $unlock_struct = pack('s s l l i', F_UNLCK, SEEK_SET, 0, 0, 0);
+
+  # now unlock
+  fcntl($cache_fh, F_SETLKW, $unlock_struct) or die "Cannot unlock file: $!";
+  print STDERR "fan$fans: Unlocked $cache_file\n";
+  system("ls -lA $cache_file 1>&2");
+  if (wantarray) {
+    return @res;
   } else {
-    die "Failed to get exclusive lock on $cache_file: $!";
+    $res = join "\n", @res;
+    return $res;
   }
 }
 
