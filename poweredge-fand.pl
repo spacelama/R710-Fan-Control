@@ -13,7 +13,7 @@ use strict;
 use warnings;
 use List::MoreUtils qw( apply );
 use File::Temp qw(tempfile);
-use JSON;
+use JSON::Parse qw/parse_json parse_json_safe/;
 use Data::Dumper;
 use POSIX ":sys_wait_h"; # for nonblocking read
 use Time::HiRes qw (sleep);
@@ -70,7 +70,7 @@ my $exhaust_poll_interval=60;
 # And put fan back under our control once per minute if someone
 # slipped it back into idrac mode, if all conditions are correct
 my $manual_mode_reset_interval=60;
-my $cpu_poll_interval=3;
+my $cpu_poll_interval=5;
 
 my $sensors_ref;
 my $temperature_calculation_sub;
@@ -119,14 +119,16 @@ sub include {
   $code = qq[#line 1 "$filename"\n] .
     $code;
   #  print "evaling code: $code\n";
+  my $success=1;
   if (!defined $included_conf_file{$filename}
       or $included_conf_file{$filename} ne $code) {
     print "(re)Parsing file $filename\n";
-    eval $code;
+    $success = eval $code;
     $included_conf_file{$filename} = $code;
   }
-  if ("$@" ne "") {
-    die "Can't eval $filename: $@";
+  if (!$success) {
+    die "Can't eval '$filename': $@";
+    # FIXME: warn?
   }
   #  print "done...\n";
 }
@@ -189,6 +191,17 @@ sub average {
   return $avg;
 }
 
+# a way to add an offset that doesn't baulk on the value being
+# undefined, without complicating syntax
+sub offset {
+  my ($v, $offset) = (@_);
+  if ((defined $v) && is_num($v)) {
+    return $v+$offset;
+  } else {
+    return undef;
+  }
+}
+
 # calculates the weighted averages
 # (i,a, j,b, k,c, ....) as
 # i*a, j*b, k*c etc, where i,j,k etc are integers>=1
@@ -216,7 +229,7 @@ sub max {
   my (@v) = (@_);
   my $max=undef;
   foreach my $v (@v) {
-    if (defined $v) {
+    if ((defined $v) && is_num($v)) {
       if (!defined $max or $v > $max) {
         $max = $v;
       }
@@ -239,7 +252,7 @@ sub hddtemp {
     my @drive_temps = obtain_cachable
       ("megaclisas_temp",
        $megasascli_poll_interval,
-       "timeout -k 1 20 /usr/local/bin/megaclisas-status");
+       "timeout -k 1 30 /usr/local/bin/megaclisas-status");
 
     if (!($device =~ /^\[\d+:\d+\]$/)) {
       $device = Cwd::realpath ($device);
@@ -283,7 +296,7 @@ sub hddtemp {
 
     # Some HDDs will be spun down, so they return "not available".
     # Treat them as if they weren't there.
-    system("timeout -k 1 20 /usr/local/bin/hddtemp --no-device --numeric $device | grep -v 'not available' > $tempfilename");
+    system("timeout -k 1 30 /usr/local/bin/hddtemp --no-device --numeric $device | grep -v 'not available' > $tempfilename");
 
     my $val = `cat < $tempfilename`; chomp $val;
     if ($val ne "") {
@@ -359,7 +372,7 @@ sub raid_controller_temp {
   my $val=obtain_cachable
     ("raid_controller_temp",
      $raid_controller_poll_interval,
-     "timeout -k 1 20 /opt/MegaRAID/MegaCli/MegaCli64 -AdpAllInfo -aALL -NoLog | grep -i ^ROC.temperature | awk '{print \$4}'");
+     "timeout -k 1 30 /opt/MegaRAID/MegaCli/MegaCli64 -AdpAllInfo -aALL -NoLog | grep -i ^ROC.temperature | awk '{print \$4}'");
   return $val;
 }
 
@@ -367,7 +380,7 @@ sub raid_controller_battery_temp {
   my $val=obtain_cachable
     ("raid_controller_battery_temp",
      $raid_controller_poll_interval,
-     "timeout -k 1 20 /opt/MegaRAID/MegaCli/MegaCli64 -AdpBbuCmd -GetBbuStatus -aALL -NoLog | grep -i ^temperature | awk '{print \$2}'");
+     "timeout -k 1 30 /opt/MegaRAID/MegaCli/MegaCli64 -AdpBbuCmd -GetBbuStatus -aALL -NoLog | grep -i ^temperature | awk '{print \$2}'");
   return $val;
 }
 
@@ -376,7 +389,7 @@ sub ambient_temp {
   my @ambient_ipmitemps = obtain_cachable
     ("ambient_temp",
      $ambient_poll_interval,
-    "timeout -k 1 20 ipmitool sdr type temperature | grep '$ipmi_inlet_sensorname' | grep [0-9]");
+    "timeout -k 1 30 ipmitool sdr type temperature | grep '$ipmi_inlet_sensorname' | grep [0-9]");
 
   # apply from List::MoreUtils
   @ambient_ipmitemps = apply { s/.*\| ([^ ]*) degrees C.*/$1/ } @ambient_ipmitemps;
@@ -395,7 +408,7 @@ sub exhaust_temp {
   my @exhaust_ipmitemps = obtain_cachable
     ("exhaust_temp",
      $exhaust_poll_interval,
-     "timeout -k 1 20 ipmitool sdr type temperature | grep '$ipmi_exhaust_sensorname' | grep [0-9]");
+     "timeout -k 1 30 ipmitool sdr type temperature | grep '$ipmi_exhaust_sensorname' | grep [0-9]");
 
   # apply from List::MoreUtils
   @exhaust_ipmitemps = apply { s/.*\| ([^ ]*) degrees C.*/$1/ } @exhaust_ipmitemps;
@@ -508,8 +521,8 @@ sub set_fans_servo {
   # up/down to tiny spikes of 1 fan unit.
   if ($in_deadband) {
     $in_deadband = ((defined $lastfan) and
-                    ($demand >= $lastfan - $hysteresis) and
-                    ($demand <= $lastfan + $hysteresis));
+                    ($demand > $lastfan - $hysteresis) and
+                    ($demand < $lastfan + $hysteresis));
   } else {
     $in_deadband = ((defined $lastfan) and
                     ($demand == $lastfan));
@@ -521,7 +534,7 @@ sub set_fans_servo {
       $demand_has_changed) {
     # allowed to print out of minute-printing cycle if the demand
     # actually changes
-    print "$stats_to_print --> ipmitool raw 0x30 0x30 0x02 $fans $demand\n";
+    print "$stats_to_print --> ipmitool raw 0x30 0x30 0x02 $fans " . ( $demand_has_changed and defined $lastfan ? "$lastfan->" : "" ) . "$demand\n";
     # ipmitool routinely fails; that's OK, if this fails, want to
     # return telling caller not to think we've made a change
     if ($demand_has_changed) {
@@ -529,6 +542,10 @@ sub set_fans_servo {
         return 0;
       }
       $lastfan = $demand;
+      if ((!defined $lastfan) or ($demand > $lastfan)) {
+        $in_deadband = 1;  # allow rapid sustained decrease, but
+                           # resist going back up again
+      }
     }
   }
   return 1;
@@ -552,7 +569,7 @@ sub child_handler {
 
 sub signal_handler {
   $signame = shift;
-  print STDERR "poweredge-fand(", (we_are_parent() ? "" : "$parent_pid -> " ), "$$): Recieved signal $signame\n";
+  print STDERR "poweredge-fand(" . (we_are_parent() ? "" : "$parent_pid -> " ) . "$$): Recieved signal $signame\n";
   $SIG{$signame} = "DEFAULT";
   exit;
 };
@@ -564,6 +581,12 @@ END {
     if ($started) {
       # we're the parent, and need to kill all our children and reset
       # fans back to default
+      foreach my $cache_bucket (keys %tempfilename) {
+        my $cache_file=$tempfilename{$cache_bucket};
+        print STDERR "Unlinking tmpfile(parent) '$cache_file'\n";
+        unlink $cache_file;
+      }
+
       my (@children) = keys %children;
       print STDERR "Killing children: @children\n";
       kill "TERM", @children;
@@ -590,11 +613,9 @@ END {
       set_fans_default;
       $signame=$saved_signame;
     }
-    foreach my $tmpfile (keys %tempfilename) {
-      unlink $tmpfile;
-    }
   } else {
     # we're a child daemon, and need to unlink our fork's temporary file
+    print STDERR "Unlinking tmpfile(fan$fans) '$tempfilename'\n";
     unlink $tempfilename if defined $tempfilename;
     print STDERR "Child fan $fans dying: $$\n";
   }
@@ -626,10 +647,14 @@ include $conf_file;
 $started=1;
 $SIG{TERM} = $SIG{HUP} = $SIG{INT} = \&signal_handler;
 
-foreach my $cache_bucket ("megaclisas_temp", "raid_controller_temp", "raid_controller_battery_temp", "ambient_temp", "exhaust_temp") {
+foreach my $cache_bucket ("sensors", "megaclisas_temp", "raid_controller_temp", "raid_controller_battery_temp", "ambient_temp", "exhaust_temp") {
+
   ($tempfh{$cache_bucket}, $tempfilename{$cache_bucket}) =
     tempfile("poweredge-fand.$cache_bucket.XXXXX", TMPDIR => 1);
+
+  select $tempfh{$cache_bucket}; $| = 1;  # make unbuffered
 }
+select STDOUT; $| = 1;  # make unbuffered
 
 foreach my $loop_fan (@daemons) {
   my $pid;
@@ -654,8 +679,9 @@ if (we_are_parent()) {
   wait;   # wait for the first child to die, then exit, killing all
           # the rest (to signal to systemd that we died)
 
-  print "One of our children died with $?, so we're exiting as a group\n";
-  exit $?;
+  my $exit = $? >> 8;
+  print "One of our children died with $exit, so we're exiting as a group\n";
+  exit $exit;
 }
 
 my $tempfh;
@@ -667,10 +693,18 @@ while () {
   # quickly debug new curves without waiting for the restart sequence:
   include $conf_file;
 
-  my $sensors_json = `timeout -k 1 20 sensors -j 2>/dev/null`;  # discard errors, annoyingly, but we do need to suppress things like
-                                                                # "ERROR: Can't get value of subfeature fan1_input: Can't read"
+  my $sensors_json = obtain_cachable
+    ("sensors",
+     $cpu_poll_interval,
+     "timeout -k 1 30 sensors -j 2>/dev/null");  # discard errors, annoyingly, but we do need to suppress things like
+                                                 # "ERROR: Can't get value of subfeature fan1_input: Can't read"
 
-  $sensors_ref = decode_json $sensors_json;
+  if (!($sensors_ref = parse_json_safe $sensors_json)) {
+    $sensors_json =~ s/\n/\\n/g;
+    $sensors_json =  substr($sensors_json, 0, 80);
+    print STDERR "fan$fans: discarding sensors from this run: '$sensors_ref' extracted from '$sensors_json...'\n";
+    goto nextpoll;
+  };
 
   # my $ambient_temp = ambient_temp();
   # if ($ambient_temp > $default_threshold) {

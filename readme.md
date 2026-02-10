@@ -54,7 +54,7 @@ module](https://github.com/spacelama/ansible-initial-server-setup/tree/master/ro
 but manual installation is:
 
 ```
-sudo apt install liblist-moreutils-perl lm-sensors ipmitool
+sudo apt install liblist-moreutils-perl lm-sensors ipmitool libjson-parse-perl
 # I also use my own hddtemp, since debian's hddtemp itself is unmaintained and can't deal with SAS drives and often spins up drives that are spun down:
 sudo apt remove hddtemp
 
