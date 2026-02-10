@@ -327,8 +327,6 @@ sub obtain_cachable {
   # we'll determine the age of the file and find that it's fresh (or
   # in need of invalidation)
 
-  print STDERR "fan$fans: Trying to obtain lock $cache_file\n";
-
   # We have to use fcntl() rather than the easier to use flock,
   # because the filedescriptors come from our parent, and all users of
   # the same file descriptor share the same flock locks.  If this
@@ -343,8 +341,6 @@ sub obtain_cachable {
 
   # Apply the lock (blocks until available)
   fcntl($cache_fh, F_SETLKW, $lock_struct) or die "Cannot lock file: $!";
-  print STDERR "fan$fans: Obtained lock $cache_file\n";
-  system("ls -lA $cache_file 1>&2");
   my ($mtime) = (stat($cache_file))[9];
   die "our state file has been deleted: $!" if (!defined $mtime);
 
@@ -369,8 +365,6 @@ sub obtain_cachable {
 
   # now unlock
   fcntl($cache_fh, F_SETLKW, $unlock_struct) or die "Cannot unlock file: $!";
-  print STDERR "fan$fans: Unlocked $cache_file\n";
-  system("ls -lA $cache_file 1>&2");
   if (wantarray) {
     return @res;
   } else {
