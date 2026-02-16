@@ -18,6 +18,7 @@ use Data::Dumper;
 use POSIX ":sys_wait_h"; # for nonblocking read
 use Time::HiRes qw (sleep);
 use Cwd;
+use Errno qw(EINTR);
 use Fcntl qw(:DEFAULT :flock SEEK_SET);
 
 my $static_speed_low;
@@ -48,8 +49,9 @@ my $hysteresis;          # Don't ramp up velocity unless demand
                          # thus end up removing noise changes for
                          # just small changes in computing
 
-my $fans;                # which fans are being controlled by this daemon?  0xff = all fans,
-                         # 0x00 to 0x05 for individual fans
+my $fans;                # which fans are being controlled by this
+                         # daemon?  0xff = all fans, 0 to 5 for
+                         # individual fans
 
 sub custom_temperature_calculation;
 
@@ -78,20 +80,33 @@ my $temperature_calculation_sub;
 my $lastfan;
 
 my $quiet=0;          # whether to print stats at all
-my $print_stats = 1;  # whether to print stats this run
+my $print_stats = 0;  # whether to print stats this run
 
 my $tempfilename;     # just a generic tmpfile owned independently by each fork
 
 my %tempfilename;     # the hash of tmpfiles we use to cache all results
 my %tempfh;           # and handles
 
-my @daemons;
+my $last_print_regular_stats=time; # when this thread last output regular stats
+
+my @daemon_pids;      # pids for each of the children in turn
+my @daemons;          # List of fans to supply to ipmitool - 0xff
+                      # denotes all fans, and 0 to 5 would be each of
+                      # the 6 individual fans, left to right, in a
+                      # poweredge rackmounted server
 my %children;
 my $started;
 my $signame;
 
 sub print_usage {
-  print STDERR "Usage: poweredge-fand.pl [-q] [-f <conf_file>]\n";
+  print STDERR <<EOF;
+Usage: $0 [-q] [-f <conf_file>]
+Controls poweredge (or any other type of server, really) fans dynamically
+
+  -q                   Quiet - only print stats when necessary instead of every minute
+  -f                   Supply conffile (/etc/poweredge-fand.conf default)
+  -h|--help            Display this help and exit
+EOF
   exit 1;
 }
 
@@ -121,7 +136,11 @@ sub include {
   my $success=1;
   if (!defined $included_conf_file{$filename}
       or $included_conf_file{$filename} ne $code) {
-    print "(re)Parsing file $filename\n";
+    if (!defined $fans) {
+      print "Parsing file $filename\n";
+    } else {
+      print "fan$fans: re-parsing file $filename\n";
+    }
     $success = eval $code;
     $included_conf_file{$filename} = $code;
   }
@@ -166,7 +185,7 @@ sub is_num {
   if ( $val =~ /^[-+]?(\d*\.?\d+|\d+\.?\d*)+$/ ) {
     return 1;
   }
-  print "is_num($val)=0\n"; # should probably warn about failures to parse values, but if you don't care about a particular error, perhaps add this clause: if !$quiet;
+  print "fan$fans: is_num($val)=0\n"; # should probably warn about failures to parse values, but if you don't care about a particular error, perhaps add this clause: if !$quiet;
   return 0;
 }
 
@@ -210,10 +229,10 @@ sub weighted_average {
 
   my (@vp) = ();
 
-  for (my $i=0; $i<@v; $i+=2) {
+  foreach (my $i=0; $i<@v; $i+=2) {
     my $integer_weight=$v[$i];
     my $value=$v[$i+1];
-    for (my $j=0; $j<$integer_weight; $j++) {
+    foreach (my $j=0; $j<$integer_weight; $j++) {
       push @vp, $value;
     }
   }
@@ -318,11 +337,33 @@ sub lock {
   # Define the flock structure (l_type, l_whence, l_start, l_len, l_pid)
   # F_WRLCK: Exclusive Write Lock
   # SEEK_SET: Start from beginning
-  # 0, 0: Offset 0, Length 0 means entire file
+  # 0, 0: Offset 0, Length 0 means entire file regardless of how much it grows
   my $lock_struct = pack('s s l l i', F_WRLCK, SEEK_SET, 0, 0, 0);
 
   # Apply the lock (blocks until available)
-  fcntl($fh, F_SETLKW, $lock_struct) or die "Cannot lock file '$name': $!";
+  my $result;
+  my $blocked;
+  # print STDERR "fan$fans: ";
+  while (1) {
+    # print STDERR "trying to lock '$name'\n";
+    $result = fcntl($fh, F_SETLKW, $lock_struct);
+    if (!$result) {
+      if ($! == EINTR) {
+        # print STDERR "fan$fans: Still can't lock '$name'\n";
+        $blocked=1;
+        # FIXME: if blocked for more than 1 minute, warn
+        next;
+      }
+      # print STDERR "fan$fans: lock, result=$result, !=$!\n";
+      die "Cannot lock file '$name': $!";
+    } else {
+      last;
+    }
+  };
+  if ($blocked) {
+    # FIXME: should print this only if still blocked from prior minute
+    print STDERR "fan$fans: locked after blocking: '$name'\n";
+  }
 }
 
 sub unlock {
@@ -331,7 +372,29 @@ sub unlock {
   # reverse the lock
   my $unlock_struct = pack('s s l l i', F_UNLCK, SEEK_SET, 0, 0, 0);
 
-  fcntl($fh, F_SETLKW, $unlock_struct) or die "Cannot unlock file '$name': $!";
+  my $result;
+  my $blocked;
+  # print STDERR "fan$fans: ";
+  while (1) {
+    # print STDERR "trying to unlock '$name'\n";
+    $result = fcntl($fh, F_SETLKW, $unlock_struct);
+    if (!$result) {
+      if ($! == EINTR) {
+        # print STDERR "fan$fans: Still can't unlock '$name'\n";
+        # FIXME: if blocked for more than 1 minute, warn
+        $blocked=1;
+        next;
+      }
+      # print STDERR "fan$fans: unlock, result=$result, !=$!\n";
+      die "Cannot unlock file '$name': $!";
+    } else {
+      last;
+    }
+  };
+  if ($blocked) {
+    # FIXME: should print this only if still blocked from prior minute
+    print STDERR "fan$fans: unlocked after blocking: '$name'\n";
+  }
 }
 
 # When we otherwise could just use a simple pipe, but we want to
@@ -437,8 +500,9 @@ sub exhaust_temp {
   return $exhaust_cache_temp;
 }
 
-sub set_fans {
+sub set_fans_mode {
   my ($new_mode) = (@_);
+  my $return=1;
 
   # All fan controllers have to agree to take the fan control out of
   # idrac control (or, more correctly, any of the controllers can put
@@ -481,10 +545,11 @@ sub set_fans {
   }
 
   if ($print_info) {
+    my $header = defined $fans ? "fan$fans" : "parent";
     if ($new_mode eq "servo") {
-      print " --> enable our manual fan control\n";
+      print "$header: $prev_mode->$new_mode    --> enable our manual fan control\n";
     } else {
-      print " --> enable dynamic (idrac automatic) fan control\n";
+      print "$header: $prev_mode->$new_mode    --> enable dynamic (idrac automatic) fan control\n";
     }
   } else {
     print "\n" if $print_stats;  # in the servo case, the caller
@@ -498,45 +563,52 @@ sub set_fans {
       # ipmitool routinely fails; that's OK, if this fails, want to
       # return telling caller not to think we've made a change
       if (system("ipmitool raw 0x30 0x30 0x01 0x00") != 0) {
-        return 0;
+        $return=0;
+        goto set_fans_mode_final;
       }
     } else {
       foreach my $attempt (1..10) {
         # ipmitool routinely fails, so try up to 10 times since we are
         # already the failure path, so need to be reliable ourselves
         if (system("ipmitool raw 0x30 0x30 0x01 0x01") == 0) {
-          return 1;
+          $return=1;
+          goto set_fans_mode_final;
         }
         sleep_and_check_for_exit 1;
         print "  Retrying dynamic control $attempt\n";
       }
       print "Retries of dynamic control all failed\n";
-      return 0;
+      $return=0;
+      goto set_fans_mode_final;
     }
-    return 1;
+    $return=1;
+    goto set_fans_mode_final;
   }
 
+ set_fans_mode_final:
   unlock($fh,$file);
+  return $return;
 }
 
 sub set_fans_default {
   $lastfan=undef;
-  return set_fans "default";
+  return set_fans_mode "default";
 }
 
 sub set_fans_servo {
   my $weighted_temp = custom_temperature_calculation();
 
   if ((!defined $weighted_temp) or ($weighted_temp == 0)) {
-    print "Error reading all temperatures! Fallback to idrac control\n";
+    print "fan$fans: Error reading all temperatures! Fallback to idrac control\n";
     set_fans_default();
-    return 0;  # we always failed, even if set_fans_default succeeded
+    return 0;  # we always failed, even if set_fans_default succeeded.
+               # set_fans_default is an exceptional condition
   }
   my $ambient_temp = ambient_temp();
   my $exhaust_temp = exhaust_temp();
   print "ambient_temp $ambient_temp ; exhaust_temp $exhaust_temp" if print_stats_once;
 
-  if (!set_fans "servo") {
+  if (!set_fans_mode "servo") {
     return 0;
   }
   my $demand = 0; # sort of starts off with a range roughly 0-255,
@@ -606,6 +678,43 @@ sub set_fans_servo {
   return 1;
 }
 
+sub wait_and_poll_output_handlers {
+  while (1) {
+    # check to see whether any children have died yet, and exit the
+    # loop as soon as one has
+    my $pid = waitpid(-1, WNOHANG);
+    if ($pid > 0) {
+      delete $children{$pid};
+      return;
+    }
+
+    my $inter_process_sequencing_sleep_interval = 10;
+    my $already_slept=0;
+    # tell all children to output their stats
+    foreach my $pid (@daemon_pids) {
+      # print STDERR "Signalling child: $pid\n";
+      kill "USR1", $pid;
+      # After the first child is triggered, allow them a lot of time
+      # to work their way through the expensive checks.  Hopefully
+      # they are finished by the time the second come through, and
+      # subsequent children should all be able to access the cached
+      # results, so allow them to cycle through quickly.  This should
+      # allow the output to be mostly sorted correctly, but lockfiles
+      # still protect the individual caches.
+      sleep_and_check_for_exit $inter_process_sequencing_sleep_interval;
+      $already_slept        += $inter_process_sequencing_sleep_interval;
+      $inter_process_sequencing_sleep_interval = 1;
+    }
+
+    # every minute ($manual_mode_reset_interval seconds), iterate
+    # through all the children and tell them to output, trying to keep
+    # their output in rough order (keeping in mind they're
+    # unsynchronised and subject to blocking conditions)
+    sleep_and_check_for_exit ($manual_mode_reset_interval -
+                              $already_slept);
+  }
+}
+
 my $parent_pid=$$;
 
 sub we_are_parent {
@@ -621,6 +730,20 @@ sub child_handler {
     # cleanup_child($pid, $?);
   }
 };
+
+# It'd be lovely if our regular updates (and to a lesser extent, our
+# updates when actively changing the fan) were ordered.  We could do
+# this when we're running separate daemons for each fan, by triggering
+# this from a signal handler and signalling each in sequence, waiting
+# for it to do the write (so waiting roughly 3 seconds per fan).  It
+# won't always be correct, but it should be close enough that the
+# output isn't discombobulating.
+sub reset_stats_handler {
+  # we force an update regardless of how many seconds since last
+  # output by this thread
+  # print STDERR "fan$fans: resetting last_print_regular_stats=$last_print_regular_stats to 0\n";
+  $last_print_regular_stats = 0;
+}
 
 sub signal_handler {
   $signame = shift;
@@ -649,7 +772,7 @@ END {
       print STDERR "Killing children: @children\n";
       kill "TERM", @children;
       my $children_left;
-      for my $checks (1..100) {
+      foreach my $checks (1..100) {
         if ( (my $pid = waitpid(-1, WNOHANG)) > 0) {
           delete $children{$pid};
           (@children) = keys %children;
@@ -704,6 +827,7 @@ while (@ARGV > 0) {
 include $conf_file;
 $started=1;
 $SIG{TERM} = $SIG{HUP} = $SIG{INT} = \&signal_handler;
+$SIG{USR1} = \&reset_stats_handler;
 
 foreach my $cache_bucket ("idrac_control", "sensors", "megaclisas_temp", "raid_controller_temp", "raid_controller_battery_temp", "ambient_temp", "exhaust_temp") {
 
@@ -719,6 +843,7 @@ foreach my $loop_fan (@daemons) {
   if ($pid=fork) {
     #parent;
     $children{$pid}=1;
+    push @daemon_pids, $pid;
     # keep looping
   } elsif ($pid==0) {
     #child;
@@ -734,8 +859,9 @@ foreach my $loop_fan (@daemons) {
 # our children (or just delegate the killing to systemd?)
 if (we_are_parent()) {
   $SIG{CHLD} = \&child_handler;
-  wait;   # wait for the first child to die, then exit, killing all
-          # the rest (to signal to systemd that we died)
+  # wait for the first child to die, then exit, killing all the rest
+  # (to signal to systemd that we died)
+  wait_and_poll_output_handlers();
 
   my $exit = $? >> 8;
   print "One of our children died with $exit, so we're exiting as a group\n";
@@ -745,7 +871,6 @@ if (we_are_parent()) {
 my $tempfh;
 ($tempfh, $tempfilename) = tempfile("poweredge-fand.child-$fans.XXXXX", TMPDIR => 1);
 
-my $last_print_stats=time;
 while () {
   # Let's parse the file everytime, and detect changes, so we can
   # quickly debug new curves without waiting for the restart sequence:
@@ -770,7 +895,7 @@ while () {
   if ($exhaust_temp > $default_exhaust_threshold) {
     if (perform_only_once) {
       #print "fallback because of high ambient temperature $ambient_temp > $default_threshold\n";
-      print "fallback because of high exhaust temperature $exhaust_temp > $default_exhaust_threshold\n";
+      print "fan$fans: fallback because of high exhaust temperature $exhaust_temp > $default_exhaust_threshold\n";
     }
     if (!set_fans_default()) {
       # return for next loop without resetting timers and delta change
@@ -786,14 +911,18 @@ while () {
   }
 
   $print_stats = 0;
-  if (time - $last_print_stats > $manual_mode_reset_interval) {
+  # print "fan$fans: is time - $last_print_regular_stats > $manual_mode_reset_interval?\n";
+  if (time - $last_print_regular_stats >
+      ($manual_mode_reset_interval + 60)) {
+    # Hopefully we're told by our parents when to reset the loop, but
+    # have a fallback if they forget to trigger us a minute past-due.
     if (perform_only_once) {
-      set_fans "reset"; # just in case the RAC has rebooted, it
-                        # will go back into default control, so
-                        # make sure we set it appropriately once
-                        # per minute
+      set_fans_mode "reset"; # just in case the RAC has rebooted, it
+                             # will go back into default control, so
+                             # make sure we set it appropriately once
+                             # per minute
     }
-    $last_print_stats=time;
+    $last_print_regular_stats=time;
     $print_stats = 1 if !$quiet;
   }
  nextpoll:
