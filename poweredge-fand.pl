@@ -98,6 +98,9 @@ my %children;
 my $started;
 my $signame;
 
+my $FAILED=0;         # I'm too much of a shell scripter to not get confused as to whether a successful function should not return 0
+my $SUCCEEDED=1;
+
 sub print_usage {
   print STDERR <<EOF;
 Usage: $0 [-q] [-f <conf_file>]
@@ -133,7 +136,7 @@ sub include {
   $code = qq[#line 1 "$filename"\n] .
     $code;
   #  print "evaling code: $code\n";
-  my $success=1;
+  my $success=$SUCCEEDED;
   if (!defined $included_conf_file{$filename}
       or $included_conf_file{$filename} ne $code) {
     if (!defined $fans) {
@@ -183,10 +186,10 @@ sub print_stats_once {
 sub is_num {
   my ($val) = @_;
   if ( $val =~ /^[-+]?(\d*\.?\d+|\d+\.?\d*)+$/ ) {
-    return 1;
+    return $SUCCEEDED;
   }
   print "fan$fans: is_num($val)=0\n"; # should probably warn about failures to parse values, but if you don't care about a particular error, perhaps add this clause: if !$quiet;
-  return 0;
+  return $FAILED;
 }
 
 # returns undef if there are no inputs, and ignores inputs that are
@@ -303,7 +306,7 @@ sub hddtemp {
     # megaclisas output.  Fall back to old fashioned hddtemp
   }
 
-  return if ! -e $device;
+  return undef if ! -e $device;
 
   if (!defined $hdd_cache_time{$device} or
       $hdd_cache_time{$device} > $hdd_poll_interval) {
@@ -349,9 +352,15 @@ sub lock {
     $result = fcntl($fh, F_SETLKW, $lock_struct);
     if (!$result) {
       if ($! == EINTR) {
-        # print STDERR "fan$fans: Still can't lock '$name'\n";
+        # This thread gets SIGUSR1 once per minute from
+        # wait_and_poll_output_handlers, which will interrupt us if
+        # we're locked
+
+        if ($blocked) {
+          # if blocked for more than 1 minute, warn
+          print STDERR "fan$fans: Still can't lock '$name'\n";
+        }
         $blocked=1;
-        # FIXME: if blocked for more than 1 minute, warn
         next;
       }
       # print STDERR "fan$fans: lock, result=$result, !=$!\n";
@@ -361,7 +370,7 @@ sub lock {
     }
   };
   if ($blocked) {
-    # FIXME: should print this only if still blocked from prior minute
+    # FIXME: should print this only if still blocked from prior minute?
     print STDERR "fan$fans: locked after blocking: '$name'\n";
   }
 }
@@ -380,8 +389,14 @@ sub unlock {
     $result = fcntl($fh, F_SETLKW, $unlock_struct);
     if (!$result) {
       if ($! == EINTR) {
-        # print STDERR "fan$fans: Still can't unlock '$name'\n";
-        # FIXME: if blocked for more than 1 minute, warn
+        # This thread gets SIGUSR1 once per minute from
+        # wait_and_poll_output_handlers, which will interrupt us if
+        # we're locked
+
+        if ($blocked) {
+          # if blocked for more than 1 minute, warn
+          print STDERR "fan$fans: Still can't unlock '$name'\n";
+        }
         $blocked=1;
         next;
       }
@@ -392,7 +407,7 @@ sub unlock {
     }
   };
   if ($blocked) {
-    # FIXME: should print this only if still blocked from prior minute
+    # FIXME: should print this only if still blocked from prior minute?
     print STDERR "fan$fans: unlocked after blocking: '$name'\n";
   }
 }
@@ -502,7 +517,7 @@ sub exhaust_temp {
 
 sub set_fans_mode {
   my ($new_mode) = (@_);
-  my $return=1;
+  my $return=$SUCCEEDED;
 
   # All fan controllers have to agree to take the fan control out of
   # idrac control (or, more correctly, any of the controllers can put
@@ -563,7 +578,7 @@ sub set_fans_mode {
       # ipmitool routinely fails; that's OK, if this fails, want to
       # return telling caller not to think we've made a change
       if (system("ipmitool raw 0x30 0x30 0x01 0x00") != 0) {
-        $return=0;
+        $return=$FAILED;
         goto set_fans_mode_final;
       }
     } else {
@@ -571,17 +586,17 @@ sub set_fans_mode {
         # ipmitool routinely fails, so try up to 10 times since we are
         # already the failure path, so need to be reliable ourselves
         if (system("ipmitool raw 0x30 0x30 0x01 0x01") == 0) {
-          $return=1;
+          $return=$SUCCEEDED;
           goto set_fans_mode_final;
         }
         sleep_and_check_for_exit 1;
         print "  Retrying dynamic control $attempt\n";
       }
       print "Retries of dynamic control all failed\n";
-      $return=0;
+      $return=$FAILED;
       goto set_fans_mode_final;
     }
-    $return=1;
+    $return=$SUCCEEDED;
     goto set_fans_mode_final;
   }
 
@@ -601,15 +616,15 @@ sub set_fans_servo {
   if ((!defined $weighted_temp) or ($weighted_temp == 0)) {
     print "fan$fans: Error reading all temperatures! Fallback to idrac control\n";
     set_fans_default();
-    return 0;  # we always failed, even if set_fans_default succeeded.
-               # set_fans_default is an exceptional condition
+    return $FAILED;  # we always failed, even if set_fans_default succeeded.
+                     # set_fans_default is an exceptional condition
   }
   my $ambient_temp = ambient_temp();
   my $exhaust_temp = exhaust_temp();
   print "ambient_temp $ambient_temp ; exhaust_temp $exhaust_temp" if print_stats_once;
 
   if (!set_fans_mode "servo") {
-    return 0;
+    return $FAILED;
   }
   my $demand = 0; # sort of starts off with a range roughly 0-255,
                   # which we multiply later to be ranged roughly
@@ -666,7 +681,7 @@ sub set_fans_servo {
     # return telling caller not to think we've made a change
     if ($demand_has_changed) {
       if (system("ipmitool raw 0x30 0x30 0x02 $fans $demand") != 0) {
-        return 0;
+        return $FAILED;
       }
       $lastfan = $demand;
       if ((!defined $lastfan) or ($demand > $lastfan)) {
@@ -675,7 +690,7 @@ sub set_fans_servo {
       }
     }
   }
-  return 1;
+  return $SUCCEEDED;
 }
 
 sub wait_and_poll_output_handlers {
