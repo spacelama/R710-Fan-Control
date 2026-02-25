@@ -19,7 +19,8 @@ use POSIX ":sys_wait_h"; # for nonblocking read
 use Time::HiRes qw (sleep);
 use Cwd;
 use Errno qw(EINTR);
-use Fcntl qw(:DEFAULT :flock SEEK_SET);
+use Fcntl qw(:DEFAULT :flock :seek :Fcompat);
+use File::FcntlLock;
 
 my $static_speed_low;
 my $static_speed_high;   # This is the speed value at 100% demand
@@ -341,7 +342,10 @@ sub lock {
   # F_WRLCK: Exclusive Write Lock
   # SEEK_SET: Start from beginning
   # 0, 0: Offset 0, Length 0 means entire file regardless of how much it grows
-  my $lock_struct = pack('s s l l i', F_WRLCK, SEEK_SET, 0, 0, 0);
+  my $fs = new File::FcntlLock;
+  $fs->l_type( F_WRLCK );
+  $fs->l_whence( SEEK_SET );
+  $fs->l_start( 0 );
 
   # Apply the lock (blocks until available)
   my $result;
@@ -349,7 +353,7 @@ sub lock {
   # print STDERR "fan$fans: ";
   while (1) {
     # print STDERR "trying to lock '$name'\n";
-    $result = fcntl($fh, F_SETLKW, $lock_struct);
+    $result = $fs->lock( $fh, F_SETLKW );
     if (!$result) {
       if ($! == EINTR) {
         # This thread gets SIGUSR1 once per minute from
@@ -358,13 +362,13 @@ sub lock {
 
         if ($blocked) {
           # if blocked for more than 1 minute, warn
-          print STDERR "fan$fans: Still can't lock '$name'\n";
+          print STDERR "fan$fans: Still can't lock '$name': $fs->error\n";
         }
         $blocked=1;
         next;
       }
       # print STDERR "fan$fans: lock, result=$result, !=$!\n";
-      die "Cannot lock file '$name': $!";
+      die "Cannot lock file '$name': $fs->error";
     } else {
       last;
     }
@@ -379,14 +383,16 @@ sub unlock {
   my ($fh, $name)=(@_);
 
   # reverse the lock
-  my $unlock_struct = pack('s s l l i', F_UNLCK, SEEK_SET, 0, 0, 0);
+  my $fs = new File::FcntlLock;
+  $fs->l_type(F_UNLCK);
 
+  seek($fh, 0, SEEK_SET) or die "seek failed: '$name': $!";
   my $result;
   my $blocked;
   # print STDERR "fan$fans: ";
   while (1) {
     # print STDERR "trying to unlock '$name'\n";
-    $result = fcntl($fh, F_SETLKW, $unlock_struct);
+    $result = $fs->lock( $fh, F_SETLK );
     if (!$result) {
       if ($! == EINTR) {
         # This thread gets SIGUSR1 once per minute from
@@ -395,13 +401,13 @@ sub unlock {
 
         if ($blocked) {
           # if blocked for more than 1 minute, warn
-          print STDERR "fan$fans: Still can't unlock '$name'\n";
+          print STDERR "fan$fans: Still can't unlock '$name': $fs->error\n";
         }
         $blocked=1;
         next;
       }
       # print STDERR "fan$fans: unlock, result=$result, !=$!\n";
-      die "Cannot unlock file '$name': $!";
+      die "Cannot unlock file '$name': $fs->error";
     } else {
       last;
     }
