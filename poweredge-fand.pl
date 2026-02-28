@@ -276,8 +276,9 @@ sub hddtemp {
        $megasascli_poll_interval,
        "timeout -k 1 30 /usr/local/bin/megaclisas-status");
 
+    # if not [*:*]: (ie, if a device file)
     if (!($device =~ /^\[\d+:\d+\]$/)) {
-      $device = Cwd::realpath ($device);
+      $device = Cwd::realpath (glob($device));
     }
     foreach my $megasas_line (@drive_temps) {
       my (@fields) =
@@ -307,8 +308,12 @@ sub hddtemp {
     # megaclisas output.  Fall back to old fashioned hddtemp
   }
 
+  # At this point, if we were provided [*:*] style device names, we
+  # didn't obtain the temperature from megasas, and we can't go any
+  # further.
   return undef if ! -e $device;
 
+  # But with a device name, we could fallback to hddtemp
   if (!defined $hdd_cache_time{$device} or
       $hdd_cache_time{$device} > $hdd_poll_interval) {
     # could just be a simple pipe, but hddtemp has a strong posibility
